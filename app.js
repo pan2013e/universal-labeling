@@ -277,9 +277,11 @@ let selectedLabel = [];
 let selectedResolution = [];
 let saveTimer = null;
 let serverSaveTimer = null;
+let workSaveTimer = null;
 let isApplyingServerState = false;
 let logoutInProgress = false;
 let busyDepth = 0;
+const pendingWorkOperations = new Map();
 let draggedContextField = "";
 let serverFileBrowser = {
   purpose: "data",
@@ -338,7 +340,10 @@ function bindEvents() {
   el.projectPicker.addEventListener("change", async () => {
     const nextProjectId = el.projectPicker.value;
     await withBusy("Switching project...", async () => {
-      await flushServerSave();
+      await flushQueuedWorkOperations({ throwOnError: true });
+      if (getPermissions().canEditProject) {
+        await flushServerSave();
+      }
       activeProjectId = nextProjectId;
       localStorage.setItem(ACTIVE_PROJECT_KEY, activeProjectId);
       await loadProjectFromServer(activeProjectId, { silent: true });
@@ -411,10 +416,22 @@ function bindEvents() {
     schedulePersist();
   });
 
-  el.currentUser.addEventListener("change", () => {
-    state.activeRole = el.currentUser.value;
-    state.currentItemId = null;
-    persistAndRender();
+  el.currentUser.addEventListener("change", async () => {
+    const nextRole = el.currentUser.value;
+    const previousRole = state.activeRole;
+    const leavingEditableRole = getPermissions().canEditProject && nextRole !== previousRole;
+    try {
+      await flushQueuedWorkOperations({ throwOnError: true });
+      if (leavingEditableRole) {
+        await withBusy("Saving project...", () => flushServerSave({ throwOnError: true }), { paintFirst: false });
+      }
+      state.activeRole = nextRole;
+      state.currentItemId = null;
+      persistAndRender(null, { queueServer: false });
+    } catch (error) {
+      alert(`Could not save project before switching roles: ${error.message}`);
+      el.currentUser.value = previousRole;
+    }
   });
 
   el.dataFile.addEventListener("change", (event) => {
@@ -693,9 +710,11 @@ function hideBusy() {
   }
 }
 
-async function withBusy(message, task) {
+async function withBusy(message, task, options = {}) {
   showBusy(message);
-  await waitForPaint();
+  if (options.paintFirst !== false) {
+    await waitForPaint();
+  }
   try {
     return await task();
   } finally {
@@ -723,7 +742,10 @@ async function logout() {
   await waitForPaint();
 
   try {
-    await withAbortTimeout((signal) => flushServerSave({ signal }));
+    await withAbortTimeout((signal) => flushQueuedWorkOperations({ signal }));
+    if (getPermissions().canEditProject) {
+      await withAbortTimeout((signal) => flushServerSave({ signal }));
+    }
     if (auth?.token) {
       await withAbortTimeout((signal) => apiRequest("/api/auth/logout", { method: "POST", signal }));
     }
@@ -731,6 +753,7 @@ async function logout() {
     // Logging out should still clear the browser session if the server token is stale.
   }
   clearTimeout(serverSaveTimer);
+  clearTimeout(workSaveTimer);
   saveAuth(null);
   projects = [];
   state = createDefaultState();
@@ -1085,8 +1108,8 @@ function toggleSelectedLabel(values, label) {
     : [...normalized, label];
 }
 
-function persistAndRender(scope = null) {
-  saveState();
+function persistAndRender(scope = null, options = {}) {
+  saveState(options);
   if (!scope) {
     renderAll();
     return;
@@ -1106,11 +1129,13 @@ function schedulePersist() {
   saveTimer = setTimeout(saveState, 250);
 }
 
-function saveState() {
+function saveState(options = {}) {
   state.lastSavedAt = new Date().toISOString();
   clearLegacyProjectCache();
   renderSaveStatus();
-  queueServerSave();
+  if (options.queueServer !== false) {
+    queueServerSave();
+  }
 }
 
 function clearLegacyProjectCache() {
@@ -1123,6 +1148,7 @@ function clearLegacyProjectCache() {
 
 function queueServerSave() {
   if (!canSaveActiveProjectState()) return;
+  if (!getPermissions().canEditProject) return;
   clearTimeout(serverSaveTimer);
   serverSaveTimer = setTimeout(saveStateToServer, 450);
 }
@@ -1143,8 +1169,11 @@ async function saveStateToServer(options = {}) {
     state.serverVersion = result.state?.serverVersion ?? state.serverVersion;
     renderSaveStatus();
     await refreshProjects();
+    return true;
   } catch (error) {
     el.saveStatus.textContent = `Sync failed: ${error.message}`;
+    if (options.throwOnError) throw error;
+    return false;
   }
 }
 
@@ -1152,6 +1181,65 @@ async function flushServerSave(options = {}) {
   clearTimeout(serverSaveTimer);
   if (!canSaveActiveProjectState()) return;
   await saveStateToServer(options);
+}
+
+function workOperationKey(operation) {
+  return `${operation.kind}:${operation.itemId}`;
+}
+
+async function saveWorkOperations(operations, options = {}) {
+  if (!canSaveActiveProjectState() || !operations.length) return false;
+  try {
+    const result = await apiRequest(`/api/projects/${encodeURIComponent(activeProjectId)}/work`, {
+      method: "PATCH",
+      body: {
+        activeRole: state.activeRole,
+        currentItemId: state.currentItemId,
+        queueMode: state.queueMode,
+        queueSearch: state.queueSearch,
+        operations
+      },
+      signal: options.signal
+    });
+    state.lastSavedAt = result.lastSavedAt || state.lastSavedAt;
+    state.serverVersion = result.serverVersion ?? state.serverVersion;
+    renderSaveStatus();
+    return true;
+  } catch (error) {
+    el.saveStatus.textContent = `Sync failed: ${error.message}`;
+    if (options.throwOnError) throw error;
+    return false;
+  }
+}
+
+function queueWorkOperation(operation) {
+  if (!canSaveActiveProjectState()) return;
+  pendingWorkOperations.set(workOperationKey(operation), operation);
+  clearTimeout(workSaveTimer);
+  workSaveTimer = setTimeout(flushQueuedWorkOperations, 450);
+}
+
+async function flushQueuedWorkOperations(options = {}) {
+  clearTimeout(workSaveTimer);
+  const operations = [...pendingWorkOperations.values()];
+  pendingWorkOperations.clear();
+  if (!operations.length) return true;
+  return saveWorkOperations(operations, options);
+}
+
+function dropPendingWorkOperation(kind, itemId) {
+  pendingWorkOperations.delete(`${kind}:${itemId}`);
+}
+
+async function flushSubmittedWork(message, operation) {
+  if (operation) {
+    pendingWorkOperations.set(workOperationKey(operation), operation);
+  }
+  try {
+    await withBusy(message, () => flushQueuedWorkOperations({ throwOnError: true }), { paintFirst: false });
+  } catch (error) {
+    alert(`Could not save to server: ${error.message}`);
+  }
 }
 
 function renderAll() {
@@ -3383,7 +3471,7 @@ function renderAnnotationComparison(itemId) {
   });
 }
 
-function saveCurrentLabel() {
+async function saveCurrentLabel() {
   const user = getCurrentUser();
   const record = state.records.find((item) => item.id === state.currentItemId);
   const values = normalizeLabelValues(selectedLabel);
@@ -3396,10 +3484,13 @@ function saveCurrentLabel() {
     updatedAt: new Date().toISOString()
   };
   deleteLabelDraft(record.id, user.id);
+  dropPendingWorkOperation("annotationDraft", record.id);
+  const decision = state.annotations[record.id][user.id];
   advanceAfterSave(user);
+  await flushSubmittedWork("Saving label...", { kind: "annotation", itemId: record.id, decision });
 }
 
-function clearCurrentLabel() {
+async function clearCurrentLabel() {
   const user = getCurrentUser();
   const record = state.records.find((item) => item.id === state.currentItemId);
   if (!user || user.role !== "labeler" || !record) return;
@@ -3410,13 +3501,15 @@ function clearCurrentLabel() {
     }
   }
   deleteLabelDraft(record.id, user.id);
+  dropPendingWorkOperation("annotationDraft", record.id);
   selectedLabel = [];
   el.labelNotes.value = "";
   state.metadata.updatedAt = new Date().toISOString();
   settleQueueAfterClear(user, record.id);
+  await flushSubmittedWork("Saving label...", { kind: "annotation", itemId: record.id, decision: null });
 }
 
-function saveCurrentResolution() {
+async function saveCurrentResolution() {
   const user = getCurrentUser();
   const record = state.records.find((item) => item.id === state.currentItemId);
   const values = normalizeLabelValues(selectedResolution);
@@ -3428,29 +3521,34 @@ function saveCurrentResolution() {
     updatedAt: new Date().toISOString()
   };
   deleteResolutionDraft(record.id, user.id);
+  dropPendingWorkOperation("resolutionDraft", record.id);
+  const decision = state.resolutions[record.id];
   advanceAfterSave(user);
+  await flushSubmittedWork("Saving resolution...", { kind: "resolution", itemId: record.id, decision });
 }
 
-function clearCurrentResolution() {
+async function clearCurrentResolution() {
   const user = getCurrentUser();
   const record = state.records.find((item) => item.id === state.currentItemId);
   if (!user || user.role !== "resolver" || !record) return;
   delete state.resolutions[record.id];
   deleteResolutionDraft(record.id, user.id);
+  dropPendingWorkOperation("resolutionDraft", record.id);
   selectedResolution = [];
   el.resolutionNotes.value = "";
   state.metadata.updatedAt = new Date().toISOString();
   settleQueueAfterClear(user, record.id);
+  await flushSubmittedWork("Saving resolution...", { kind: "resolution", itemId: record.id, decision: null });
 }
 
 function advanceAfterSave(user) {
   const queueBefore = getVisibleQueue(user);
   const currentIndex = queueBefore.findIndex((record) => record.id === state.currentItemId);
-  saveState();
+  saveState({ queueServer: false });
   const queueAfter = getVisibleQueue(user);
   const next = queueAfter[currentIndex] || queueAfter[currentIndex - 1] || queueAfter[0] || null;
   state.currentItemId = next?.id || null;
-  saveState();
+  saveState({ queueServer: false });
   renderAll();
 }
 
@@ -3459,7 +3557,7 @@ function settleQueueAfterClear(user, clearedItemId) {
   if (!queueAfter.some((record) => record.id === clearedItemId)) {
     state.currentItemId = queueAfter[0]?.id || null;
   }
-  persistAndRender(["workspace", "stats", "exports"]);
+  persistAndRender(["workspace", "stats", "exports"], { queueServer: false });
 }
 
 function saveLabelDraftForCurrent() {
@@ -3474,7 +3572,11 @@ function saveLabelDraftForCurrent() {
     notes: el.labelNotes.value.trim(),
     updatedAt: new Date().toISOString()
   };
-  schedulePersist();
+  queueWorkOperation({
+    kind: "annotationDraft",
+    itemId: record.id,
+    decision: state.drafts.annotations[record.id][user.id]
+  });
 }
 
 function saveResolutionDraftForCurrent() {
@@ -3489,7 +3591,11 @@ function saveResolutionDraftForCurrent() {
     resolverId: user.id,
     updatedAt: new Date().toISOString()
   };
-  schedulePersist();
+  queueWorkOperation({
+    kind: "resolutionDraft",
+    itemId: record.id,
+    decision: state.drafts.resolutions[record.id][user.id]
+  });
 }
 
 function getLabelDraft(itemId, userId) {

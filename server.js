@@ -919,6 +919,102 @@ function mergeMemberWork(existing, incoming, actorPublicId, roles) {
   return merged;
 }
 
+function clearNestedDecision(container, itemId, actorPublicId) {
+  if (!container?.[itemId]) return;
+  delete container[itemId][actorPublicId];
+  if (!Object.keys(container[itemId]).length) delete container[itemId];
+}
+
+function setNestedDecision(container, itemId, actorPublicId, decision) {
+  container[itemId] ||= {};
+  container[itemId][actorPublicId] = decision;
+}
+
+function decisionForActor(rawDecision, actorPublicId, extra = {}) {
+  const decision = migrateDecision(rawDecision || {});
+  return {
+    ...decision,
+    ...extra,
+    userId: actorPublicId,
+    updatedAt: decision.updatedAt || nowIso()
+  };
+}
+
+function applyWorkOperations(project, actorPublicId, roles, body) {
+  const activeRole = String(body?.activeRole || "");
+  const writeRoles = writeRolesForStateSave(roles, activeRole);
+  const state = migrateProjectStateShape(JSON.parse(project.state_json));
+  state.annotations ||= {};
+  state.resolutions ||= {};
+  state.drafts ||= { annotations: {}, resolutions: {} };
+  state.drafts.annotations ||= {};
+  state.drafts.resolutions ||= {};
+  state.currentItemId = body?.currentItemId || state.currentItemId || null;
+  state.queueMode = body?.queueMode || state.queueMode || "todo";
+  state.queueSearch = body?.queueSearch || state.queueSearch || "";
+
+  const operations = Array.isArray(body?.operations) ? body.operations.slice(0, 100) : [];
+  let applied = 0;
+  operations.forEach((operation) => {
+    const kind = String(operation?.kind || "");
+    const itemId = String(operation?.itemId || "");
+    if (!itemId) return;
+    const hasDecision = operation.decision && typeof operation.decision === "object";
+    const assignedToActor = (role) => (state.assignments || [])
+      .some((assignment) => assignment.itemId === itemId && assignment.userId === actorPublicId && assignment.role === role);
+
+    if (kind === "annotation" && writeRoles.includes("labeler") && assignedToActor("labeler")) {
+      clearNestedDecision(state.annotations, itemId, actorPublicId);
+      clearNestedDecision(state.drafts.annotations, itemId, actorPublicId);
+      if (hasDecision) {
+        setNestedDecision(state.annotations, itemId, actorPublicId, decisionForActor(operation.decision, actorPublicId));
+      }
+      applied += 1;
+      return;
+    }
+
+    if (kind === "annotationDraft" && writeRoles.includes("labeler") && assignedToActor("labeler")) {
+      clearNestedDecision(state.drafts.annotations, itemId, actorPublicId);
+      if (hasDecision) {
+        setNestedDecision(state.drafts.annotations, itemId, actorPublicId, decisionForActor(operation.decision, actorPublicId));
+      }
+      applied += 1;
+      return;
+    }
+
+    if (kind === "resolution" && writeRoles.includes("resolver") && assignedToActor("resolver")) {
+      if (state.resolutions[itemId]?.resolverId === actorPublicId) delete state.resolutions[itemId];
+      clearNestedDecision(state.drafts.resolutions, itemId, actorPublicId);
+      if (hasDecision) {
+        state.resolutions[itemId] = decisionForActor(operation.decision, actorPublicId, { resolverId: actorPublicId });
+      }
+      applied += 1;
+      return;
+    }
+
+    if (kind === "resolutionDraft" && writeRoles.includes("resolver") && assignedToActor("resolver")) {
+      clearNestedDecision(state.drafts.resolutions, itemId, actorPublicId);
+      if (hasDecision) {
+        setNestedDecision(state.drafts.resolutions, itemId, actorPublicId, decisionForActor(operation.decision, actorPublicId, { resolverId: actorPublicId }));
+      }
+      applied += 1;
+    }
+  });
+
+  if (!operations.length) {
+    const error = new Error("No work updates were provided.");
+    error.status = 400;
+    throw error;
+  }
+  if (!applied) {
+    const error = new Error("No work updates were allowed for the active role.");
+    error.status = 403;
+    throw error;
+  }
+
+  return saveProjectState(project, state);
+}
+
 function saveProjectState(project, nextState, options = {}) {
   const shouldCheckpoint = options.checkpoint !== false;
   const state = sanitizedStoredState(nextState, project.id);
@@ -1160,6 +1256,30 @@ app.put("/api/projects/:projectId/state", requireAuth, requireProjectMember, (re
     }
     req.project = project;
     sendProject(req, res, project);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch("/api/projects/:projectId/work", requireAuth, requireProjectMember, (req, res, next) => {
+  try {
+    const project = applyWorkOperations(
+      req.project,
+      publicUserIdFromHash(req.user.username_hash),
+      req.roles,
+      req.body || {}
+    );
+    res.json({
+      ok: true,
+      project: {
+        id: project.id,
+        name: project.name,
+        updatedAt: project.updated_at,
+        version: project.version
+      },
+      lastSavedAt: project.updated_at,
+      serverVersion: project.version
+    });
   } catch (error) {
     next(error);
   }

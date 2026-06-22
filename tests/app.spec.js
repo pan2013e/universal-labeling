@@ -119,6 +119,110 @@ test("loads sample data and labels one item with a multi-role admin account", as
   await expect(page.getByText("1/4 label assignments")).toBeVisible();
 });
 
+test("submitted labels survive refresh when switching back to labeler role", async ({ page }, testInfo) => {
+  await signIn(page, usernameFor(testInfo, "admin"));
+  await enableOwnRole(page, "labeler");
+  await selectRole(page, "admin");
+  const projectId = await page.locator("#projectPicker").inputValue();
+  await loadSample(page);
+  await selectRole(page, "labeler");
+  await page.getByRole("button", { name: "Workspace" }).click();
+
+  await page.locator("#labelChoices").getByRole("button", { name: "Behavioral issue", exact: true }).click();
+  await page.getByRole("button", { name: "Save label" }).click();
+  await expect.poll(() => {
+    const stored = readStoredProject(projectId);
+    return Object.values(stored.state.annotations).flatMap((byUser) => Object.values(byUser)).length;
+  }).toBe(1);
+
+  await page.locator("#labelChoices").getByRole("button", { name: "Style or maintainability", exact: true }).click();
+  await page.getByRole("button", { name: "Save label" }).click();
+  await expect.poll(() => {
+    const stored = readStoredProject(projectId);
+    return Object.values(stored.state.annotations).flatMap((byUser) => Object.values(byUser)).length;
+  }).toBe(2);
+
+  await page.reload();
+  await expect(page.locator("#appShell")).toBeVisible();
+  await selectRole(page, "labeler");
+  await page.getByRole("button", { name: "Workspace" }).click();
+  await page.locator("#queueMode button[data-mode='done']").click();
+
+  await expect(page.locator("#recordPosition")).toHaveText("Item 1 of 2");
+  await expect(page.locator(".queue-item")).toHaveCount(2);
+});
+
+test("submitted label uses compact work update instead of full project state", async ({ page }, testInfo) => {
+  await signIn(page, usernameFor(testInfo, "admin"));
+  await enableOwnRole(page, "labeler");
+  await selectRole(page, "admin");
+  await loadSample(page);
+  await selectRole(page, "labeler");
+  await page.getByRole("button", { name: "Workspace" }).click();
+
+  let fullStateSaves = 0;
+  const workPayloads = [];
+  await page.route("**/api/projects/*/state", async (route) => {
+    if (route.request().method() === "PUT") fullStateSaves += 1;
+    await route.continue();
+  });
+  await page.route("**/api/projects/*/work", async (route) => {
+    if (route.request().method() === "PATCH") {
+      workPayloads.push(route.request().postDataJSON());
+    }
+    await route.continue();
+  });
+
+  await page.locator("#labelChoices").getByRole("button", { name: "Behavioral issue", exact: true }).click();
+  await page.getByRole("button", { name: "Save label" }).click();
+
+  expect(fullStateSaves).toBe(0);
+  expect(workPayloads).toHaveLength(1);
+  expect(JSON.stringify(workPayloads[0])).not.toContain("\"records\"");
+  expect(workPayloads[0].operations).toMatchObject([
+    { kind: "annotation" }
+  ]);
+
+  await page.locator("#queueMode button[data-mode='done']").click();
+  await page.locator("#queueSearch").fill("rendering");
+  await page.locator(".queue-item").first().click();
+  await page.waitForTimeout(700);
+  expect(fullStateSaves).toBe(0);
+});
+
+test("compact work update rejects unassigned item writes", async ({ page }, testInfo) => {
+  await signIn(page, usernameFor(testInfo, "admin"));
+  await enableOwnRole(page, "labeler");
+  await selectRole(page, "admin");
+  const projectId = await page.locator("#projectPicker").inputValue();
+  await loadSample(page);
+  await selectRole(page, "labeler");
+
+  const result = await page.evaluate(async (id) => {
+    const response = await fetch(`/api/projects/${encodeURIComponent(id)}/work`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        activeRole: "labeler",
+        operations: [{
+          kind: "annotation",
+          itemId: "not-assigned",
+          decision: { value: "Behavioral issue", values: ["Behavioral issue"] }
+        }]
+      })
+    });
+    return {
+      status: response.status,
+      body: await response.json()
+    };
+  }, projectId);
+
+  expect(result.status).toBe(403);
+  expect(result.body.error).toContain("No work updates");
+  const stored = readStoredProject(projectId);
+  expect(stored.state.annotations["not-assigned"]).toBeUndefined();
+});
+
 test("labeler can clear a submitted label from the Done queue", async ({ page }, testInfo) => {
   await signIn(page, usernameFor(testInfo, "admin"));
   await enableOwnRole(page, "labeler");
