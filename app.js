@@ -220,6 +220,54 @@ function createDefaultState() {
   };
 }
 
+function createBlankProjectState() {
+  const blank = createDefaultState();
+  blank.projectName = "New Project";
+  blank.metadata = {
+    ...blank.metadata,
+    projectId: "",
+    creatorName: "",
+    description: "",
+    createdAt: null,
+    updatedAt: null
+  };
+  blank.dataSource = {
+    name: "",
+    path: "",
+    format: "",
+    size: 0,
+    embedded: true
+  };
+  blank.sampling = {
+    ...blank.sampling,
+    sampledItemIds: [],
+    appliedAt: null
+  };
+  blank.contextFiles = [];
+  blank.importedAt = null;
+  blank.detectedFormat = null;
+  blank.records = [];
+  blank.fields = {
+    id: "",
+    title: "",
+    body: "",
+    code: "",
+    meta: []
+  };
+  blank.assignments = [];
+  blank.annotations = {};
+  blank.resolutions = {};
+  blank.drafts = {
+    annotations: {},
+    resolutions: {}
+  };
+  blank.currentItemId = null;
+  blank.queueMode = "todo";
+  blank.queueSearch = "";
+  blank.lastSavedAt = null;
+  return blank;
+}
+
 let state = loadState();
 let auth = loadAuth();
 let projects = [];
@@ -290,7 +338,7 @@ function bindEvents() {
     localStorage.setItem(ACTIVE_PROJECT_KEY, activeProjectId);
     loadProjectFromServer(activeProjectId);
   });
-  el.createProject.addEventListener("click", createProjectOnServer);
+  el.createProject.addEventListener("click", () => createProjectOnServer({ blank: true }));
   el.deleteProject.addEventListener("click", deleteCurrentProject);
 
   el.projectName.addEventListener("input", () => {
@@ -473,7 +521,9 @@ function bindEvents() {
   el.exportLabelsJsonl.addEventListener("click", exportLabelsJsonl);
   el.exportFinalCsv.addEventListener("click", exportFinalCsv);
   el.saveLabel.addEventListener("click", saveCurrentLabel);
+  el.clearLabel.addEventListener("click", clearCurrentLabel);
   el.saveResolution.addEventListener("click", saveCurrentResolution);
+  el.clearResolution.addEventListener("click", clearCurrentResolution);
 
   el.confidenceInput.addEventListener("input", () => {
     el.confidenceValue.textContent = `${el.confidenceInput.value}%`;
@@ -639,17 +689,18 @@ async function refreshProjects() {
   renderProjectPicker();
 }
 
-async function createProjectOnServer() {
+async function createProjectOnServer(options = {}) {
   if (!auth?.token) {
     alert("Sign in before creating a project.");
     return;
   }
+  const projectState = options.blank ? createBlankProjectState() : createDefaultState();
   try {
     const result = await apiRequest("/api/projects", {
       method: "POST",
       body: {
-        projectName: state.projectName,
-        state: sanitizeStateForServer(state)
+        projectName: projectState.projectName,
+        state: sanitizeStateForServer(projectState)
       }
     });
     applyServerProject(result);
@@ -3170,10 +3221,13 @@ function validateLabelForm() {
         : "";
   el.labelValidation.textContent = message;
   el.saveLabel.disabled = Boolean(message);
+  el.clearLabel.disabled = !selectedValues.length && !hasCurrentLabelDecision();
 }
 
 function validateResolutionForm() {
-  el.saveResolution.disabled = !normalizeLabelValues(selectedResolution).length;
+  const selectedValues = normalizeLabelValues(selectedResolution);
+  el.saveResolution.disabled = !selectedValues.length;
+  el.clearResolution.disabled = !selectedValues.length && !hasCurrentResolutionDecision();
 }
 
 function renderCustomLabelControls() {
@@ -3244,6 +3298,23 @@ function saveCurrentLabel() {
   advanceAfterSave(user);
 }
 
+function clearCurrentLabel() {
+  const user = getCurrentUser();
+  const record = state.records.find((item) => item.id === state.currentItemId);
+  if (!user || user.role !== "labeler" || !record) return;
+  if (state.annotations[record.id]) {
+    delete state.annotations[record.id][user.id];
+    if (!Object.keys(state.annotations[record.id]).length) {
+      delete state.annotations[record.id];
+    }
+  }
+  deleteLabelDraft(record.id, user.id);
+  selectedLabel = [];
+  el.labelNotes.value = "";
+  state.metadata.updatedAt = new Date().toISOString();
+  settleQueueAfterClear(user, record.id);
+}
+
 function saveCurrentResolution() {
   const user = getCurrentUser();
   const record = state.records.find((item) => item.id === state.currentItemId);
@@ -3259,6 +3330,18 @@ function saveCurrentResolution() {
   advanceAfterSave(user);
 }
 
+function clearCurrentResolution() {
+  const user = getCurrentUser();
+  const record = state.records.find((item) => item.id === state.currentItemId);
+  if (!user || user.role !== "resolver" || !record) return;
+  delete state.resolutions[record.id];
+  deleteResolutionDraft(record.id, user.id);
+  selectedResolution = [];
+  el.resolutionNotes.value = "";
+  state.metadata.updatedAt = new Date().toISOString();
+  settleQueueAfterClear(user, record.id);
+}
+
 function advanceAfterSave(user) {
   const queueBefore = getVisibleQueue(user);
   const currentIndex = queueBefore.findIndex((record) => record.id === state.currentItemId);
@@ -3268,6 +3351,14 @@ function advanceAfterSave(user) {
   state.currentItemId = next?.id || null;
   saveState();
   renderAll();
+}
+
+function settleQueueAfterClear(user, clearedItemId) {
+  const queueAfter = getVisibleQueue(user);
+  if (!queueAfter.some((record) => record.id === clearedItemId)) {
+    state.currentItemId = queueAfter[0]?.id || null;
+  }
+  persistAndRender(["workspace", "stats", "exports"]);
 }
 
 function saveLabelDraftForCurrent() {
@@ -3306,6 +3397,26 @@ function getLabelDraft(itemId, userId) {
 
 function getResolutionDraft(itemId, userId) {
   return state.drafts.resolutions[itemId]?.[userId] || null;
+}
+
+function hasCurrentLabelDecision() {
+  const user = getCurrentUser();
+  const record = state.records.find((item) => item.id === state.currentItemId);
+  if (!user || !record) return false;
+  return Boolean(
+    decisionValues(state.annotations[record.id]?.[user.id]).length ||
+    decisionValues(getLabelDraft(record.id, user.id)).length
+  );
+}
+
+function hasCurrentResolutionDecision() {
+  const user = getCurrentUser();
+  const record = state.records.find((item) => item.id === state.currentItemId);
+  if (!user || !record) return false;
+  return Boolean(
+    decisionValues(state.resolutions[record.id]).length ||
+    decisionValues(getResolutionDraft(record.id, user.id)).length
+  );
 }
 
 function deleteLabelDraft(itemId, userId) {

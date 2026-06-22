@@ -119,6 +119,27 @@ test("loads sample data and labels one item with a multi-role admin account", as
   await expect(page.getByText("1/4 label assignments")).toBeVisible();
 });
 
+test("labeler can clear a submitted label from the Done queue", async ({ page }, testInfo) => {
+  await signIn(page, usernameFor(testInfo, "admin"));
+  await enableOwnRole(page, "labeler");
+  await selectRole(page, "admin");
+  const projectId = await page.locator("#projectPicker").inputValue();
+  await loadSample(page);
+  await selectRole(page, "labeler");
+  await page.getByRole("button", { name: "Workspace" }).click();
+
+  await page.locator("#labelChoices").getByRole("button", { name: "Behavioral issue", exact: true }).click();
+  await page.getByRole("button", { name: "Save label" }).click();
+  await page.locator("#queueMode button[data-mode='done']").click();
+  await expect(page.locator("#recordPosition")).toHaveText("Item 1 of 1");
+
+  await page.getByRole("button", { name: "Clear selection" }).click();
+
+  await expect(page.locator("#emptyReview")).toContainText("No assigned work matches this queue.");
+  const stored = readStoredProject(projectId);
+  expect(Object.values(stored.state.annotations).flatMap((byUser) => Object.values(byUser))).toHaveLength(0);
+});
+
 test("assigned participant signs in and starts work from the server project", async ({ page }, testInfo) => {
   const admin = usernameFor(testInfo, "admin");
   const labeler = usernameFor(testInfo, "labeler");
@@ -148,6 +169,24 @@ test("large project payloads are not written to browser localStorage", async ({ 
   await loadSample(page);
   await expect(page.locator("#recordCount")).toHaveText("4");
   await expect.poll(() => page.evaluate(() => localStorage.getItem("universal-labeling.project.v1"))).toBeNull();
+});
+
+test("new project starts from a blank workspace instead of cloning current data", async ({ page }, testInfo) => {
+  await signIn(page, usernameFor(testInfo, "admin"));
+  await loadSample(page);
+  await page.locator("#creatorName").fill("Previous Creator");
+  await page.locator("#projectId").fill("previous-project");
+  await page.locator("#projectDescription").fill("Previous project description");
+  await expect(page.locator("#recordCount")).toHaveText("4");
+
+  await page.getByRole("button", { name: "New project" }).click();
+
+  await expect(page.locator("#projectName")).toHaveValue("New Project");
+  await expect(page.locator("#creatorName")).toHaveValue("");
+  await expect(page.locator("#projectId")).toHaveValue("");
+  await expect(page.locator("#projectDescription")).toHaveValue("");
+  await expect(page.locator("#dataFilePath")).toHaveValue("");
+  await expect(page.locator("#recordCount")).toHaveText("0");
 });
 
 test("server filesystem browser opens in a modal and reports availability", async ({ page }, testInfo) => {
@@ -419,6 +458,49 @@ test("example project persists two labels, one resolution, and exports results",
   expect(finalCsv).not.toContain(labelerA);
   expect(finalCsv).not.toContain(labelerB);
   expect(finalCsv).not.toContain(resolver);
+});
+
+test("resolver can clear a submitted resolution from the All queue", async ({ page }, testInfo) => {
+  const admin = usernameFor(testInfo, "admin");
+  const labelerA = usernameFor(testInfo, "labeler_a");
+  const labelerB = usernameFor(testInfo, "labeler_b");
+  const resolver = usernameFor(testInfo, "resolver");
+  const itemId = "sympy-23927-c1";
+
+  await signIn(page, admin);
+  const projectId = await page.locator("#projectPicker").inputValue();
+  await loadSample(page);
+  await addMember(page, labelerA, "Labeler One", "labeler");
+  await addMember(page, labelerB, "Labeler Two", "labeler");
+  await addMember(page, resolver, "Resolver One", "resolver");
+  await signOut(page);
+
+  await signIn(page, labelerA);
+  await page.getByRole("button", { name: "Workspace" }).click();
+  await page.locator(".queue-item").filter({ hasText: "This branch changes rendering" }).click();
+  await page.locator("#labelChoices").getByRole("button", { name: "Behavioral issue", exact: true }).click();
+  await page.getByRole("button", { name: "Save label" }).click();
+  await signOut(page);
+
+  await signIn(page, labelerB);
+  await page.getByRole("button", { name: "Workspace" }).click();
+  await page.locator(".queue-item").filter({ hasText: "This branch changes rendering" }).click();
+  await page.locator("#labelChoices").getByRole("button", { name: "Style or maintainability", exact: true }).click();
+  await page.getByRole("button", { name: "Save label" }).click();
+  await signOut(page);
+
+  await signIn(page, resolver);
+  await page.getByRole("button", { name: "Workspace" }).click();
+  await page.locator("#resolutionChoices").getByRole("button", { name: "Behavioral issue", exact: true }).click();
+  await page.getByRole("button", { name: "Save resolution" }).click();
+  await page.locator("#queueMode button[data-mode='all']").click();
+  await expect(page.locator("#recordPosition")).toHaveText("Item 1 of 1");
+
+  await page.getByRole("button", { name: "Clear selection" }).click();
+
+  await expect(page.locator("#resolutionChoices").getByRole("button", { name: "Behavioral issue", exact: true })).toHaveAttribute("aria-pressed", "false");
+  const stored = readStoredProject(projectId);
+  expect(stored.state.resolutions[itemId]).toBeUndefined();
 });
 
 test("admin is exported but never assigned review work unless given review roles", async ({ page }, testInfo) => {

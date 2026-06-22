@@ -335,6 +335,11 @@ label > span,
   width: 100%;
 }
 
+.account-name {
+  display: block;
+  text-align: center;
+}
+
 .save-pill {
   background: rgba(255, 255, 255, 0.1);
   border: 1px solid var(--sidebar-line);
@@ -812,10 +817,12 @@ td {
   color: var(--ink);
   display: grid;
   gap: 6px;
+  justify-content: stretch;
   justify-items: start;
   padding: 10px;
   text-align: left;
   white-space: normal;
+  width: 100%;
 }
 
 .queue-item:hover,
@@ -828,6 +835,8 @@ td {
   display: block;
   line-height: 1.25;
   overflow-wrap: anywhere;
+  text-align: left;
+  width: 100%;
 }
 
 .status-line {
@@ -966,6 +975,12 @@ td {
 }
 
 .custom-label-row {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.annotation-actions {
   display: grid;
   gap: 8px;
   grid-template-columns: minmax(0, 1fr) auto;
