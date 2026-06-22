@@ -278,6 +278,8 @@ let selectedResolution = [];
 let saveTimer = null;
 let serverSaveTimer = null;
 let isApplyingServerState = false;
+let logoutInProgress = false;
+let busyDepth = 0;
 let draggedContextField = "";
 let serverFileBrowser = {
   purpose: "data",
@@ -335,10 +337,12 @@ function bindEvents() {
   el.logoutButton.addEventListener("click", logout);
   el.projectPicker.addEventListener("change", async () => {
     const nextProjectId = el.projectPicker.value;
-    await flushServerSave();
-    activeProjectId = nextProjectId;
-    localStorage.setItem(ACTIVE_PROJECT_KEY, activeProjectId);
-    loadProjectFromServer(activeProjectId);
+    await withBusy("Switching project...", async () => {
+      await flushServerSave();
+      activeProjectId = nextProjectId;
+      localStorage.setItem(ACTIVE_PROJECT_KEY, activeProjectId);
+      await loadProjectFromServer(activeProjectId, { silent: true });
+    });
   });
   el.createProject.addEventListener("click", () => createProjectOnServer({ blank: true }));
   el.deleteProject.addEventListener("click", deleteCurrentProject);
@@ -622,17 +626,19 @@ async function initializeSession() {
   renderAuth();
   if (!auth?.token) return;
   try {
-    const me = await apiRequest("/api/me");
-    saveAuth({ ...auth, user: me.user });
-    await refreshProjects();
-    if (projects.length) {
-      const targetProject = projects.some((project) => project.id === activeProjectId)
-        ? activeProjectId
-        : projects[0].id;
-      await loadProjectFromServer(targetProject);
-    } else {
-      await createProjectOnServer();
-    }
+    await withBusy("Restoring session...", async () => {
+      const me = await apiRequest("/api/me");
+      saveAuth({ ...auth, user: me.user });
+      await refreshProjects();
+      if (projects.length) {
+        const targetProject = projects.some((project) => project.id === activeProjectId)
+          ? activeProjectId
+          : projects[0].id;
+        await loadProjectFromServer(targetProject);
+      } else {
+        await createProjectOnServer();
+      }
+    });
   } catch (error) {
     console.warn("Could not restore session", error);
     saveAuth(null);
@@ -647,38 +653,91 @@ async function loginFromForm() {
     return;
   }
   try {
-    const result = await apiRequest("/api/auth/login", {
-      method: "POST",
-      body: { username }
+    await withBusy("Signing in...", async () => {
+      const result = await apiRequest("/api/auth/login", {
+        method: "POST",
+        body: { username }
+      });
+      saveAuth(result);
+      await refreshProjects();
+      if (projects.length) {
+        const targetProject = projects.some((project) => project.id === activeProjectId)
+          ? activeProjectId
+          : projects[0].id;
+        await loadProjectFromServer(targetProject);
+      } else {
+        await createProjectOnServer();
+      }
+      renderAll();
     });
-    saveAuth(result);
-    await refreshProjects();
-    if (projects.length) {
-      const targetProject = projects.some((project) => project.id === activeProjectId)
-        ? activeProjectId
-        : projects[0].id;
-      await loadProjectFromServer(targetProject);
-    } else {
-      await createProjectOnServer();
-    }
-    renderAll();
   } catch (error) {
     alert(error.message);
   }
 }
 
-async function logout() {
+function waitForPaint() {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+function showBusy(message = "Working...") {
+  busyDepth += 1;
+  if (!el.busyOverlay) return;
+  el.busyMessage.textContent = message;
+  el.busyOverlay.classList.remove("hidden");
+}
+
+function hideBusy() {
+  busyDepth = Math.max(0, busyDepth - 1);
+  if (!busyDepth) {
+    el.busyOverlay?.classList.add("hidden");
+  }
+}
+
+async function withBusy(message, task) {
+  showBusy(message);
+  await waitForPaint();
   try {
-    await flushServerSave();
+    return await task();
+  } finally {
+    hideBusy();
+  }
+}
+
+async function withAbortTimeout(task, timeoutMs = 5000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await task(controller.signal);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function logout() {
+  if (logoutInProgress) return;
+  logoutInProgress = true;
+  el.logoutButton.disabled = true;
+  el.logoutButton.textContent = "Signing out...";
+  el.saveStatus.textContent = "Signing out...";
+  showBusy("Signing out...");
+  await waitForPaint();
+
+  try {
+    await withAbortTimeout((signal) => flushServerSave({ signal }));
     if (auth?.token) {
-      await apiRequest("/api/auth/logout", { method: "POST" });
+      await withAbortTimeout((signal) => apiRequest("/api/auth/logout", { method: "POST", signal }));
     }
   } catch {
     // Logging out should still clear the browser session if the server token is stale.
   }
+  clearTimeout(serverSaveTimer);
   saveAuth(null);
   projects = [];
   state = createDefaultState();
+  logoutInProgress = false;
+  el.logoutButton.disabled = false;
+  el.logoutButton.textContent = "Sign out";
+  hideBusy();
   renderAll();
 }
 
@@ -699,16 +758,18 @@ async function createProjectOnServer(options = {}) {
   }
   const projectState = options.blank ? createBlankProjectState() : createDefaultState();
   try {
-    const result = await apiRequest("/api/projects", {
-      method: "POST",
-      body: {
-        projectName: projectState.projectName,
-        state: sanitizeStateForServer(projectState)
-      }
+    await withBusy("Creating project...", async () => {
+      const result = await apiRequest("/api/projects", {
+        method: "POST",
+        body: {
+          projectName: projectState.projectName,
+          state: sanitizeStateForServer(projectState)
+        }
+      });
+      applyServerProject(result);
+      await refreshProjects();
+      renderAll();
     });
-    applyServerProject(result);
-    await refreshProjects();
-    renderAll();
   } catch (error) {
     alert(error.message);
   }
@@ -725,34 +786,43 @@ async function deleteCurrentProject() {
   if (!confirmed) return;
 
   try {
-    clearTimeout(serverSaveTimer);
-    await apiRequest(`/api/projects/${encodeURIComponent(activeProjectId)}`, {
-      method: "DELETE"
+    await withBusy("Deleting project...", async () => {
+      clearTimeout(serverSaveTimer);
+      await apiRequest(`/api/projects/${encodeURIComponent(activeProjectId)}`, {
+        method: "DELETE"
+      });
+      localStorage.removeItem(ACTIVE_PROJECT_KEY);
+      localStorage.removeItem(STORAGE_KEY);
+      activeProjectId = "";
+      state = createDefaultState();
+      selectedLabel = [];
+      selectedResolution = [];
+      await refreshProjects();
+      if (projects.length) {
+        await loadProjectFromServer(projects[0].id);
+      } else {
+        await createProjectOnServer();
+      }
+      renderAll();
     });
-    localStorage.removeItem(ACTIVE_PROJECT_KEY);
-    localStorage.removeItem(STORAGE_KEY);
-    activeProjectId = "";
-    state = createDefaultState();
-    selectedLabel = [];
-    selectedResolution = [];
-    await refreshProjects();
-    if (projects.length) {
-      await loadProjectFromServer(projects[0].id);
-    } else {
-      await createProjectOnServer();
-    }
-    renderAll();
   } catch (error) {
     alert(error.message);
   }
 }
 
-async function loadProjectFromServer(projectId) {
+async function loadProjectFromServer(projectId, options = {}) {
   if (!auth?.token || !projectId) return;
   try {
-    const result = await apiRequest(`/api/projects/${encodeURIComponent(projectId)}`);
-    applyServerProject(result);
-    renderAll();
+    const load = async () => {
+      const result = await apiRequest(`/api/projects/${encodeURIComponent(projectId)}`);
+      applyServerProject(result);
+      renderAll();
+    };
+    if (options.silent) {
+      await load();
+    } else {
+      await withBusy("Loading project...", load);
+    }
   } catch (error) {
     alert(error.message);
   }
@@ -1061,12 +1131,13 @@ function canSaveActiveProjectState() {
   return Boolean(auth?.token && activeProjectId && !isApplyingServerState && state.serverProjectId === activeProjectId);
 }
 
-async function saveStateToServer() {
+async function saveStateToServer(options = {}) {
   if (!canSaveActiveProjectState()) return;
   try {
     const result = await apiRequest(`/api/projects/${encodeURIComponent(activeProjectId)}/state`, {
       method: "PUT",
-      body: { state: sanitizeStateForServer(state) }
+      body: { state: sanitizeStateForServer(state) },
+      signal: options.signal
     });
     state.lastSavedAt = result.state?.lastSavedAt || state.lastSavedAt;
     state.serverVersion = result.state?.serverVersion ?? state.serverVersion;
@@ -1077,10 +1148,10 @@ async function saveStateToServer() {
   }
 }
 
-async function flushServerSave() {
+async function flushServerSave(options = {}) {
   clearTimeout(serverSaveTimer);
   if (!canSaveActiveProjectState()) return;
-  await saveStateToServer();
+  await saveStateToServer(options);
 }
 
 function renderAll() {
@@ -1352,8 +1423,10 @@ async function loadServerFileList(relativePath = ".") {
     return;
   }
   try {
-    const result = await apiRequest(`/api/projects/${encodeURIComponent(activeProjectId)}/server-files?path=${encodeURIComponent(relativePath || ".")}`);
-    renderServerFileList(result);
+    await withBusy("Loading server files...", async () => {
+      const result = await apiRequest(`/api/projects/${encodeURIComponent(activeProjectId)}/server-files?path=${encodeURIComponent(relativePath || ".")}`);
+      renderServerFileList(result);
+    });
   } catch (error) {
     el.serverFileStatus.textContent = error.message;
     el.serverFileList.innerHTML = "";
@@ -1417,15 +1490,17 @@ function renderServerFileList(result) {
 
 async function previewServerFile(relativePath) {
   try {
-    const result = await apiRequest(`/api/projects/${encodeURIComponent(activeProjectId)}/server-files/read`, {
-      method: "POST",
-      body: { path: relativePath, purpose: serverFileBrowser.purpose }
+    await withBusy("Loading preview...", async () => {
+      const result = await apiRequest(`/api/projects/${encodeURIComponent(activeProjectId)}/server-files/read`, {
+        method: "POST",
+        body: { path: relativePath, purpose: serverFileBrowser.purpose }
+      });
+      serverFileBrowser.selectedFile = result.file;
+      document.querySelectorAll(".server-file-row").forEach((row) => {
+        row.classList.toggle("selected", row.dataset.path === result.file.path);
+      });
+      renderServerFilePreview(result.file);
     });
-    serverFileBrowser.selectedFile = result.file;
-    document.querySelectorAll(".server-file-row").forEach((row) => {
-      row.classList.toggle("selected", row.dataset.path === result.file.path);
-    });
-    renderServerFilePreview(result.file);
   } catch (error) {
     alert(error.message);
   }
@@ -2141,47 +2216,49 @@ async function attachPerItemServerContext() {
 
   el.itemContextStatus.textContent = `Resolving ${patterns.length} server file patterns...`;
   try {
-    const result = await apiRequest(`/api/projects/${encodeURIComponent(activeProjectId)}/server-files/resolve`, {
-      method: "POST",
-      body: { patterns, maxMatchesPerPattern: 5 }
-    });
-    const byId = new Map(state.records.map((record) => [record.id, record]));
-    let attached = 0;
-    let missing = 0;
-    (result.matches || []).forEach((match) => {
-      const record = byId.get(match.itemId);
-      const files = match.files || [];
-      if (!record || !files.length) {
-        missing += 1;
-        return;
-      }
-      record.contextFiles ||= [];
-      files.forEach((file) => {
-        const contextId = `item_ctx_${slugify(file.path || file.name)}`;
-        const existing = record.contextFiles.find((context) => context.path === file.path);
-        const next = {
-          id: contextId,
-          title,
-          name: file.name,
-          path: file.path,
-          size: file.size,
-          text: file.text,
-          source: "server-template",
-          addedAt: new Date().toISOString()
-        };
-        if (existing) {
-          Object.assign(existing, next);
-        } else {
-          record.contextFiles.push(next);
-        }
-        attached += 1;
+    await withBusy("Resolving context files...", async () => {
+      const result = await apiRequest(`/api/projects/${encodeURIComponent(activeProjectId)}/server-files/resolve`, {
+        method: "POST",
+        body: { patterns, maxMatchesPerPattern: 5 }
       });
+      const byId = new Map(state.records.map((record) => [record.id, record]));
+      let attached = 0;
+      let missing = 0;
+      (result.matches || []).forEach((match) => {
+        const record = byId.get(match.itemId);
+        const files = match.files || [];
+        if (!record || !files.length) {
+          missing += 1;
+          return;
+        }
+        record.contextFiles ||= [];
+        files.forEach((file) => {
+          const contextId = `item_ctx_${slugify(file.path || file.name)}`;
+          const existing = record.contextFiles.find((context) => context.path === file.path);
+          const next = {
+            id: contextId,
+            title,
+            name: file.name,
+            path: file.path,
+            size: file.size,
+            text: file.text,
+            source: "server-template",
+            addedAt: new Date().toISOString()
+          };
+          if (existing) {
+            Object.assign(existing, next);
+          } else {
+            record.contextFiles.push(next);
+          }
+          attached += 1;
+        });
+      });
+      missing += (result.errors || []).length;
+      state.protocol.includeItemContext = true;
+      state.metadata.updatedAt = new Date().toISOString();
+      el.itemContextStatus.textContent = `${attached} files attached / ${missing} items missing or errored.`;
+      persistAndRender(["data", "workspace", "exports"]);
     });
-    missing += (result.errors || []).length;
-    state.protocol.includeItemContext = true;
-    state.metadata.updatedAt = new Date().toISOString();
-    el.itemContextStatus.textContent = `${attached} files attached / ${missing} items missing or errored.`;
-    persistAndRender(["data", "workspace", "exports"]);
   } catch (error) {
     el.itemContextStatus.textContent = error.message;
   }
@@ -2866,20 +2943,22 @@ async function addUser() {
     return;
   }
   try {
-    await flushServerSave();
-    const result = await apiRequest(`/api/projects/${encodeURIComponent(activeProjectId)}/members`, {
-      method: "POST",
-      body: {
-        username,
-        participantName,
-        roles: [el.newUserRole.value]
-      }
+    await withBusy("Saving roster...", async () => {
+      await flushServerSave();
+      const result = await apiRequest(`/api/projects/${encodeURIComponent(activeProjectId)}/members`, {
+        method: "POST",
+        body: {
+          username,
+          participantName,
+          roles: [el.newUserRole.value]
+        }
+      });
+      applyServerProject(result);
+      el.newUserName.value = "";
+      el.newParticipantName.value = "";
+      rebuildAssignments();
+      persistAndRender();
     });
-    applyServerProject(result);
-    el.newUserName.value = "";
-    el.newParticipantName.value = "";
-    rebuildAssignments();
-    persistAndRender();
   } catch (error) {
     alert(error.message);
   }
@@ -2891,17 +2970,19 @@ async function updateProjectMember(user) {
     return;
   }
   try {
-    await flushServerSave();
-    const result = await apiRequest(`/api/projects/${encodeURIComponent(activeProjectId)}/members/${encodeURIComponent(user.id)}`, {
-      method: "PATCH",
-      body: {
-        participantName: user.participantName || user.name || user.id,
-        roles: getUserRoles(user)
-      }
+    await withBusy("Saving roster...", async () => {
+      await flushServerSave();
+      const result = await apiRequest(`/api/projects/${encodeURIComponent(activeProjectId)}/members/${encodeURIComponent(user.id)}`, {
+        method: "PATCH",
+        body: {
+          participantName: user.participantName || user.name || user.id,
+          roles: getUserRoles(user)
+        }
+      });
+      applyServerProject(result);
+      rebuildAssignments();
+      persistAndRender();
     });
-    applyServerProject(result);
-    rebuildAssignments();
-    persistAndRender();
   } catch (error) {
     alert(error.message);
     await loadProjectFromServer(activeProjectId);
@@ -2925,11 +3006,13 @@ async function removeUser(userId) {
   }
   if (activeProjectId) {
     try {
-      await flushServerSave();
-      const result = await apiRequest(`/api/projects/${encodeURIComponent(activeProjectId)}/members/${encodeURIComponent(userId)}`, {
-        method: "DELETE"
+      await withBusy("Saving roster...", async () => {
+        await flushServerSave();
+        const result = await apiRequest(`/api/projects/${encodeURIComponent(activeProjectId)}/members/${encodeURIComponent(userId)}`, {
+          method: "DELETE"
+        });
+        applyServerProject(result);
       });
-      applyServerProject(result);
     } catch (error) {
       alert(error.message);
       return;

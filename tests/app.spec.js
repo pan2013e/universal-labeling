@@ -217,6 +217,23 @@ test("signing out and back in restores the previously active project", async ({ 
   await expect(page.locator("#projectName")).toHaveValue("Persistent Project");
 });
 
+test("sign out gives immediate feedback when the final save is slow", async ({ page }, testInfo) => {
+  await signIn(page, usernameFor(testInfo, "admin"));
+  await loadSample(page);
+  await page.route("**/api/projects/*/state", async (route) => {
+    if (route.request().method() === "PUT") {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+    await route.continue();
+  });
+
+  await page.getByRole("button", { name: "Sign out" }).click();
+
+  await expect(page.getByRole("button", { name: "Signing out..." })).toBeDisabled();
+  await expect(page.locator("#busyOverlay")).toContainText("Signing out...");
+  await expect(page.locator("#authStatus")).toContainText("Not signed in");
+});
+
 test("server rejects stale state saves for a different project id", async ({ page }, testInfo) => {
   await signIn(page, usernameFor(testInfo, "admin"));
   const projectId = await page.locator("#projectPicker").inputValue();

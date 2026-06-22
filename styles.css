@@ -866,6 +866,47 @@ td {
   display: none !important;
 }
 
+.busy-overlay {
+  align-items: center;
+  background: rgba(15, 23, 42, 0.28);
+  backdrop-filter: blur(1px);
+  display: flex;
+  inset: 0;
+  justify-content: center;
+  position: fixed;
+  z-index: 2000;
+}
+
+.busy-panel {
+  align-items: center;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 18px 42px rgba(15, 23, 42, 0.18);
+  color: var(--ink);
+  display: inline-flex;
+  font-weight: 760;
+  gap: 12px;
+  min-width: 220px;
+  padding: 16px 18px;
+}
+
+.busy-spinner {
+  animation: busy-spin 850ms linear infinite;
+  border: 3px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 999px;
+  flex: 0 0 auto;
+  height: 24px;
+  width: 24px;
+}
+
+@keyframes busy-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .record-header {
   border-bottom: 1px solid var(--line);
   margin-bottom: 16px;
