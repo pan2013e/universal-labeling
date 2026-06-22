@@ -1,0 +1,666 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Universal Labeling</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <section id="loginPage" class="login-page">
+      <div class="login-card">
+        <div class="login-brand">
+          <div class="brand-mark">UL</div>
+          <div>
+            <h1>Universal Labeling</h1>
+            <p>Research labeling, resolution, and agreement tracking.</p>
+          </div>
+        </div>
+        <div class="login-copy">
+          <h2>Sign in to your labeling workspace</h2>
+          <p>Use your unique account name. Project exports use hashed account ids and project participant names.</p>
+        </div>
+        <div class="login-form">
+          <label>
+            <span>User name</span>
+            <input id="loginUsername" type="text" autocomplete="username" placeholder="unique.user">
+          </label>
+          <button id="loginButton" type="button">Sign in</button>
+        </div>
+      </div>
+    </section>
+
+    <div id="appShell" class="app-shell hidden">
+      <aside class="sidebar" aria-label="Primary">
+        <div class="brand">
+          <div class="brand-mark">UL</div>
+          <div>
+            <h1>Universal Labeling</h1>
+            <p id="projectStatus">No dataset loaded</p>
+          </div>
+        </div>
+        <nav class="nav-list" aria-label="Views">
+          <button class="nav-item" data-view="workspace" type="button">
+            <span class="nav-icon">&#9998;</span>
+            <span>Workspace</span>
+          </button>
+          <button class="nav-item active" data-view="backend" type="button">
+            <span class="nav-icon">&#9678;</span>
+            <span>Backend</span>
+          </button>
+        </nav>
+        <div class="sidebar-controls" aria-label="Project and account controls">
+          <label class="project-name">
+            <span>Project</span>
+            <input id="projectName" type="text" autocomplete="off">
+          </label>
+          <label class="project-switcher">
+            <span>Server project</span>
+            <select id="projectPicker"></select>
+          </label>
+          <button id="createProject" class="secondary full-width" type="button">New project</button>
+          <button id="deleteProject" class="danger subtle full-width" type="button">Delete project</button>
+          <label class="current-user">
+            <span>Active role</span>
+            <select id="currentUser"></select>
+          </label>
+          <div class="account-panel">
+            <span id="authStatus" class="account-name">Not signed in</span>
+            <button id="logoutButton" class="secondary full-width hidden" type="button">Sign out</button>
+          </div>
+          <div class="save-pill" id="saveStatus">Not saved yet</div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <section class="view" id="view-data" aria-labelledby="dataTitle">
+          <div class="section-heading">
+            <div>
+              <h2 id="dataTitle">Dataset Intake</h2>
+              <p id="dataStatusLine">No records imported.</p>
+            </div>
+            <div class="button-row">
+              <label class="file-button">
+                <input id="dataFile" type="file" accept=".json,.jsonl,.ndjson,.csv,.tsv,.txt,application/json,text/plain,text/csv">
+                Import data
+              </label>
+              <button id="openServerDataFile" class="secondary" type="button">Server file</button>
+              <button id="loadSample" class="secondary" type="button">Load sample</button>
+            </div>
+          </div>
+
+          <div class="dashboard-grid">
+            <article class="metric-card">
+              <span class="metric-label">Detected format</span>
+              <strong id="detectedFormat">None</strong>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">Records</span>
+              <strong id="recordCount">0</strong>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">Fields</span>
+              <strong id="fieldCount">0</strong>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">Import time</span>
+              <strong id="importTime">-</strong>
+            </article>
+          </div>
+
+          <div class="two-column">
+            <section class="panel">
+              <div class="panel-heading">
+                <h3>Project Metadata</h3>
+              </div>
+              <div class="form-grid">
+                <label>
+                  <span>Creator</span>
+                  <input id="creatorName" type="text" autocomplete="off">
+                </label>
+                <label>
+                  <span>Project id</span>
+                  <input id="projectId" type="text" autocomplete="off">
+                </label>
+                <label>
+                  <span>Data file path</span>
+                  <input id="dataFilePath" type="text" autocomplete="off" placeholder="data/items.jsonl">
+                </label>
+                <label>
+                  <span>Description</span>
+                  <textarea id="projectDescription" rows="4"></textarea>
+                </label>
+              </div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-heading">
+                <h3>Additional Context Files</h3>
+                <label class="file-button secondary">
+                  <input id="contextFiles" type="file" multiple accept=".txt,.md,.json,.jsonl,.csv,.tsv,.yaml,.yml,text/plain,application/json">
+                  Add files
+                </label>
+                <button id="openServerContextFiles" class="secondary" type="button">Server files</button>
+              </div>
+              <div id="contextFileList" class="context-file-list"></div>
+            </section>
+          </div>
+
+          <section class="panel wide">
+            <div class="panel-heading">
+              <h3>Derived Items & Per-item Context</h3>
+              <span id="derivedItemStatus" class="muted">No derived item transform applied.</span>
+            </div>
+            <div class="derived-grid">
+              <label>
+                <span>Split array field</span>
+                <select id="splitArrayField"></select>
+              </label>
+              <button id="splitArrayRecords" class="secondary" type="button">Split into labeling items</button>
+              <label>
+                <span>Server path template</span>
+                <input id="itemContextTemplate" type="text" autocomplete="off" placeholder="testgen_combined/{instance_id}/test_review_comment_{comment_index}.*">
+              </label>
+              <label>
+                <span>Context title</span>
+                <input id="itemContextTitle" type="text" autocomplete="off" value="Generated test">
+              </label>
+              <button id="attachItemContext" type="button">Attach per-item context</button>
+            </div>
+            <p id="itemContextStatus" class="muted">Use placeholders from record fields, such as {instance_id} or {reference_review_comments.__stage3_comment_index}.</p>
+          </section>
+
+          <div class="two-column">
+            <section class="panel">
+              <div class="panel-heading">
+                <h3>Field Mapping</h3>
+              </div>
+              <div class="form-grid" id="fieldMapping"></div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-heading">
+                <h3>Data Quality</h3>
+              </div>
+              <div id="qualityList" class="quality-list"></div>
+            </section>
+          </div>
+
+          <section class="panel wide">
+            <div class="panel-heading">
+                <div class="heading-with-help">
+                  <h3>Sampling Plan</h3>
+                  <button class="help-button" type="button" data-help="sampling" aria-label="Sampling help">?</button>
+                </div>
+              <span id="samplingStatus" class="muted"></span>
+            </div>
+            <div class="sampling-grid">
+              <label>
+                <span>Use entries</span>
+                <select id="samplingMode">
+                  <option value="all">All data entries</option>
+                  <option value="percent">Random percent</option>
+                  <option value="count">Random count</option>
+                </select>
+              </label>
+              <label id="samplingPercentField">
+                <span>Percent</span>
+                <input id="samplingPercent" type="number" min="1" max="100" step="1">
+              </label>
+              <label id="samplingCountField">
+                <span>Count</span>
+                <input id="samplingCount" type="number" min="1" step="1">
+              </label>
+              <button id="applySampling" type="button">Apply sampling</button>
+            </div>
+            <div class="sample-calculator">
+              <div>
+                <h4>Sample Size Suggestion</h4>
+                <p class="muted">Estimated for a finite population using confidence level, margin of error, and population proportion.</p>
+              </div>
+              <label>
+                <span>Confidence</span>
+                <select id="sampleConfidence">
+                  <option value="90">90%</option>
+                  <option value="95">95%</option>
+                  <option value="99">99%</option>
+                </select>
+              </label>
+              <label>
+                <span>Margin of error</span>
+                <input id="sampleMargin" type="number" min="1" max="50" step="0.5">
+              </label>
+              <label>
+                <span>Population proportion</span>
+                <input id="sampleProportion" type="number" min="1" max="99" step="1">
+              </label>
+              <div class="suggested-sample">
+                <span class="metric-label">Suggested count</span>
+                <strong id="suggestedSampleSize">0</strong>
+              </div>
+              <button id="useSuggestedSample" class="secondary" type="button">Use suggestion</button>
+            </div>
+            <div id="samplingWarnings" class="warning-list"></div>
+          </section>
+
+          <section class="panel wide">
+            <div class="panel-heading">
+              <div class="heading-with-help">
+                <h3>Question Context Fields</h3>
+                <button class="help-button" type="button" data-help="context-fields" aria-label="Question context help">?</button>
+              </div>
+              <button id="selectRecommendedContext" class="secondary" type="button">Use mapped fields</button>
+            </div>
+            <div class="field-selection-layout">
+              <div id="contextFieldList" class="field-check-list context-field-list"></div>
+              <div class="context-preview-column">
+                <span class="metric-label">Sample shown to labelers</span>
+                <div id="contextSample" class="sample-context"></div>
+                <span class="metric-label preview-label">Question preview</span>
+                <div id="questionPreview" class="question-preview"></div>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel wide">
+            <div class="panel-heading">
+              <h3>Preview</h3>
+              <span id="previewMeta" class="muted"></span>
+            </div>
+            <div class="table-wrap">
+              <table id="previewTable"></table>
+            </div>
+          </section>
+        </section>
+
+        <section class="view" id="view-protocol" aria-labelledby="protocolTitle">
+          <div class="section-heading">
+            <div>
+              <h2 id="protocolTitle">Labeling Protocol</h2>
+              <p id="protocolStatusLine">Default protocol active.</p>
+            </div>
+            <button id="applyProtocol" type="button">Apply protocol</button>
+          </div>
+
+          <div class="two-column">
+            <section class="panel">
+              <div class="panel-heading">
+                <h3>Decision</h3>
+              </div>
+              <div class="form-grid">
+                <label>
+                  <span>Primary question</span>
+                  <input id="primaryQuestion" type="text">
+                </label>
+                <div>
+                  <span class="metric-label">Allowed labels</span>
+                  <div id="labelList" class="label-editor-list"></div>
+                  <div class="label-add-row">
+                    <input id="newLabelName" type="text" autocomplete="off" placeholder="New label">
+                    <button id="addLabelOption" class="secondary" type="button">Add label</button>
+                  </div>
+                </div>
+                <label>
+                  <span>Instructions</span>
+                  <textarea id="protocolInstructions" rows="5" placeholder="Decision rules, edge cases, examples, or resolver guidance"></textarea>
+                </label>
+                <label>
+                  <span>Labelers per item</span>
+                  <input id="labelersPerItem" type="number" min="1" max="8">
+                </label>
+                <label>
+                  <span>Labels per answer</span>
+                  <select id="labelCardinality">
+                    <option value="single">Single label</option>
+                    <option value="multiple">Multiple labels</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Resolution queue</span>
+                  <select id="resolutionPolicy">
+                    <option value="disagreements">Only disagreements</option>
+                    <option value="all">All fully labeled items</option>
+                    <option value="manual">Manual export only</option>
+                  </select>
+                </label>
+              </div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-heading">
+              <div class="heading-with-help">
+                <h3>Evidence</h3>
+                <button class="help-button" type="button" data-help="evidence" aria-label="Evidence help">?</button>
+              </div>
+              </div>
+              <div class="check-list">
+                <label class="check-row">
+                  <input id="requireConfidence" type="checkbox">
+                  <span>Require confidence for submitted labels</span>
+                </label>
+                <label class="check-row">
+                  <input id="allowCustomLabels" type="checkbox">
+                  <span>Allow labelers and resolvers to add labels during work</span>
+                </label>
+                <label class="check-row">
+                  <input id="enableUncertain" type="checkbox">
+                  <span>Enable uncertain label handling</span>
+                </label>
+                <label class="check-row">
+                  <input id="requireNotes" type="checkbox">
+                  <span>Require notes when selecting an uncertain label</span>
+                </label>
+                <label id="uncertainLabelRow">
+                  <span>Uncertain label text</span>
+                  <input id="uncertainLabel" type="text">
+                </label>
+                <label>
+                  <span>Resolution question</span>
+                  <input id="resolutionQuestion" type="text">
+                </label>
+              </div>
+            </section>
+          </div>
+
+          <section class="panel wide">
+            <div class="panel-heading">
+              <h3>Protocol Snapshot</h3>
+            </div>
+            <pre id="protocolSnapshot" class="code-block"></pre>
+          </section>
+        </section>
+
+        <section class="view" id="view-people" aria-labelledby="peopleTitle">
+          <div class="section-heading">
+            <div>
+              <h2 id="peopleTitle">Participants</h2>
+              <p id="peopleStatusLine">Default roster active.</p>
+            </div>
+            <button id="rebuildAssignments" type="button">Rebuild assignments</button>
+          </div>
+
+          <section class="panel">
+            <div class="compact-form">
+              <label>
+                <span>User name</span>
+                <input id="newUserName" type="text" placeholder="unique.user">
+              </label>
+              <label>
+                <span>Participant name</span>
+                <input id="newParticipantName" type="text" placeholder="Reviewer 01">
+              </label>
+              <label>
+                <span>Role</span>
+                <select id="newUserRole">
+                  <option value="labeler">Labeler</option>
+                  <option value="resolver">Resolver</option>
+                  <option value="admin">Admin</option>
+                </select>
+              </label>
+              <button id="addUser" type="button">Add/update member</button>
+            </div>
+          </section>
+
+          <section class="panel wide">
+            <div class="panel-heading">
+              <div class="heading-with-help">
+                <h3>Roster</h3>
+                <button class="help-button" type="button" data-help="roster" aria-label="Roster help">?</button>
+              </div>
+            </div>
+            <div id="userList" class="user-list"></div>
+          </section>
+        </section>
+
+        <section class="view" id="view-workspace" aria-labelledby="workspaceTitle">
+          <div class="section-heading">
+            <div>
+              <h2 id="workspaceTitle">Review Workspace</h2>
+              <p id="queueSummary">No assigned work.</p>
+            </div>
+            <div class="segmented" id="queueMode">
+              <button class="active" data-mode="todo" type="button">Todo</button>
+              <button data-mode="done" type="button">Done</button>
+              <button data-mode="all" type="button">All</button>
+            </div>
+          </div>
+
+          <div class="workspace-layout">
+            <aside class="queue-panel">
+              <div class="queue-toolbar">
+                <input id="queueSearch" type="search" placeholder="Search queue">
+                <span id="queueCount" class="muted"></span>
+              </div>
+              <div id="queueList" class="queue-list"></div>
+            </aside>
+
+            <section class="review-panel">
+              <div id="emptyReview" class="empty-state">Import data and build assignments to begin.</div>
+              <div id="reviewContent" class="review-content hidden">
+                <div class="record-header">
+                  <span id="recordPosition" class="eyebrow"></span>
+                  <h3 id="recordTitle"></h3>
+                  <div id="recordMeta" class="record-meta"></div>
+                </div>
+                <div id="recordBody" class="record-body"></div>
+
+                <div id="labelerControls" class="annotation-box">
+                  <h4 id="labelQuestion"></h4>
+                  <div id="protocolInstructionText" class="instruction-text hidden"></div>
+                  <div id="labelChoices" class="choice-grid"></div>
+                  <div id="customLabelRow" class="custom-label-row hidden">
+                    <input id="customLabelInput" type="text" autocomplete="off" placeholder="New label">
+                    <button id="addCustomLabel" class="secondary" type="button">Add label</button>
+                  </div>
+                  <label>
+                    <span>Confidence</span>
+                    <input id="confidenceInput" type="range" min="0" max="100" step="5">
+                  </label>
+                  <div class="confidence-line">
+                    <span id="confidenceValue">50%</span>
+                    <span id="labelValidation" class="warning-text"></span>
+                  </div>
+                  <label>
+                    <span>Notes</span>
+                    <textarea id="labelNotes" rows="4"></textarea>
+                  </label>
+                  <button id="saveLabel" type="button">Save label</button>
+                </div>
+
+                <div id="resolverControls" class="annotation-box hidden">
+                  <h4 id="resolutionQuestionText"></h4>
+                  <div id="resolutionInstructionText" class="instruction-text hidden"></div>
+                  <div id="annotationComparison" class="comparison-list"></div>
+                  <div id="resolutionChoices" class="choice-grid"></div>
+                  <div id="customResolutionLabelRow" class="custom-label-row hidden">
+                    <input id="customResolutionLabelInput" type="text" autocomplete="off" placeholder="New final label">
+                    <button id="addCustomResolutionLabel" class="secondary" type="button">Add label</button>
+                  </div>
+                  <label>
+                    <span>Resolution rationale</span>
+                    <textarea id="resolutionNotes" rows="4"></textarea>
+                  </label>
+                  <button id="saveResolution" type="button">Save resolution</button>
+                </div>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-stats" aria-labelledby="statsTitle">
+          <div class="section-heading">
+            <div>
+              <h2 id="statsTitle">Agreement & Progress</h2>
+              <p id="statsStatusLine">No submitted labels.</p>
+            </div>
+          </div>
+          <div class="dashboard-grid" id="statsCards"></div>
+          <div class="two-column">
+            <section class="panel">
+              <div class="panel-heading">
+                <h3>Label Distribution</h3>
+              </div>
+              <div id="labelDistribution" class="bar-list"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-heading">
+                <h3>Participant Throughput</h3>
+              </div>
+              <div class="table-wrap compact">
+                <table id="throughputTable"></table>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view active" id="view-exports" aria-labelledby="exportsTitle">
+          <div class="section-heading">
+            <div>
+              <div class="heading-with-help">
+                <h2 id="exportsTitle">Backend Console</h2>
+                <button class="help-button" type="button" data-help="outputs" aria-label="Backend help">?</button>
+              </div>
+              <p id="exportsStatusLine">Project state is stored on the central server.</p>
+            </div>
+          </div>
+
+          <section class="panel">
+            <div class="workflow-grid">
+              <div class="workflow-card creator-card">
+                <div class="workflow-card-head">
+                  <div>
+                    <span class="metric-label">Admin</span>
+                    <h3>Export a portable definition</h3>
+                  </div>
+                  <button class="help-button" type="button" data-help="creator-export" aria-label="Creator export help">?</button>
+                </div>
+                <p class="muted">Package the setup reviewers need without drafts or submitted labels.</p>
+                <dl class="definition-summary">
+                  <div><dt>Includes</dt><dd>metadata, protocol, sampling, assignments</dd></div>
+                  <div><dt>Embeds</dt><dd>selected records and context files</dd></div>
+                  <div><dt>Excludes</dt><dd>local drafts, labels, resolver decisions</dd></div>
+                </dl>
+                <button id="exportProjectDefinition" type="button">Export definition</button>
+              </div>
+              <div class="workflow-card participant-card">
+                <div class="workflow-card-head">
+                  <div>
+                    <span class="metric-label">Participant</span>
+                    <h3>Import a definition file</h3>
+                  </div>
+                  <button class="help-button" type="button" data-help="participant-load" aria-label="Participant load help">?</button>
+                </div>
+                <p class="muted">Most work starts from the server project selector. Use this only for an exported definition file.</p>
+                <div class="form-grid">
+                  <label>
+                    <span>Name</span>
+                    <input id="participantName" type="text" autocomplete="off" placeholder="Reviewer name">
+                  </label>
+                  <label>
+                    <span>User id</span>
+                    <input id="participantId" type="text" autocomplete="off" placeholder="reviewer_01">
+                  </label>
+                  <label>
+                    <span>Role</span>
+                    <select id="participantRole">
+                      <option value="labeler">Labeler</option>
+                      <option value="resolver">Resolver</option>
+                    </select>
+                  </label>
+                  <label class="file-button">
+                    <input id="participantProjectFile" type="file" accept=".json,application/json">
+                    Load definition
+                  </label>
+                </div>
+              </div>
+              <div class="workflow-card resume-card">
+                <span class="metric-label">Resume</span>
+                <h3>Full local state</h3>
+                <p class="muted">Use this for continuing the same browser workspace with drafts, labels, and resolver decisions.</p>
+                <div class="button-row">
+                  <button id="exportProject" class="secondary" type="button">Export full state</button>
+                  <label class="file-button secondary">
+                    <input id="projectFile" type="file" accept=".json,application/json">
+                    Restore full state
+                  </label>
+                </div>
+              </div>
+              <div class="workflow-card results-card">
+                <span class="metric-label">Results</span>
+                <h3>Download outputs</h3>
+                <p class="muted">Exports submitted labels and final resolved labels for analysis.</p>
+                <div class="button-row">
+                  <button id="exportLabelsJsonl" type="button">Labels JSONL</button>
+                  <button id="exportFinalCsv" type="button">Final CSV</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel wide">
+            <div class="panel-heading">
+              <h3>Browser Session Cache</h3>
+            </div>
+            <button id="clearProject" class="danger" type="button">Clear session cache</button>
+          </section>
+
+          <section class="panel wide">
+            <div class="panel-heading">
+              <h3>Export Preview</h3>
+            </div>
+            <pre id="exportPreview" class="code-block"></pre>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <div id="helpModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="helpModalTitle">
+      <div class="modal">
+        <header class="modal-header">
+          <h2 id="helpModalTitle">Help</h2>
+          <button id="closeHelpModal" class="secondary icon-button" type="button" aria-label="Close help">x</button>
+        </header>
+        <div id="helpModalBody" class="modal-body"></div>
+      </div>
+    </div>
+
+    <div id="serverFileModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="serverFileTitle">
+      <div class="modal server-file-modal">
+        <header class="modal-header">
+          <div>
+            <h2 id="serverFileTitle">Server Files</h2>
+            <p id="serverFileStatus" class="muted">Server filesystem access is disabled.</p>
+          </div>
+          <button id="closeServerFileModal" class="secondary icon-button" type="button" aria-label="Close server file browser">x</button>
+        </header>
+        <div class="modal-body server-file-modal-body">
+          <div class="server-file-toolbar">
+            <button id="serverFileUp" class="secondary" type="button">Up</button>
+            <input id="serverFilePath" type="text" autocomplete="off" placeholder=".">
+            <button id="serverFileGo" class="secondary" type="button">Open path</button>
+          </div>
+          <div class="server-file-layout">
+            <section class="server-file-browser" aria-label="Server file list">
+              <div id="serverFileList" class="server-file-list"></div>
+            </section>
+            <aside class="server-file-preview-panel" aria-label="Server file preview">
+              <div class="server-file-preview-head">
+                <div>
+                  <span class="metric-label">Preview</span>
+                  <h3 id="serverFilePreviewName">No file selected</h3>
+                  <p id="serverFilePreviewMeta" class="muted">Choose a file to preview it before importing.</p>
+                </div>
+              </div>
+              <pre id="serverFilePreview" class="server-file-preview">No preview loaded.</pre>
+              <div class="server-file-actions">
+                <button id="serverFileConfirm" type="button" disabled>Import selected</button>
+              </div>
+            </aside>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

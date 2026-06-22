@@ -1,0 +1,23 @@
+{
+  "name": "universal-labeling",
+  "version": "1.0.0",
+  "description": "A browser-based labeling and resolution workspace for software engineering research datasets.",
+  "main": "server.js",
+  "scripts": {
+    "serve": "node server.js",
+    "test": "npm run test:e2e",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@playwright/test": "^1.61.0"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "express": "^5.2.1"
+  }
+}
