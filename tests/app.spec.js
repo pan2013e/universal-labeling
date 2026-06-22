@@ -130,14 +130,20 @@ test("labeler can clear a submitted label from the Done queue", async ({ page },
 
   await page.locator("#labelChoices").getByRole("button", { name: "Behavioral issue", exact: true }).click();
   await page.getByRole("button", { name: "Save label" }).click();
+  await expect.poll(() => {
+    const stored = readStoredProject(projectId);
+    return Object.values(stored.state.annotations).flatMap((byUser) => Object.values(byUser)).length;
+  }).toBe(1);
   await page.locator("#queueMode button[data-mode='done']").click();
   await expect(page.locator("#recordPosition")).toHaveText("Item 1 of 1");
 
   await page.getByRole("button", { name: "Clear selection" }).click();
 
   await expect(page.locator("#emptyReview")).toContainText("No assigned work matches this queue.");
-  const stored = readStoredProject(projectId);
-  expect(Object.values(stored.state.annotations).flatMap((byUser) => Object.values(byUser))).toHaveLength(0);
+  await expect.poll(() => {
+    const stored = readStoredProject(projectId);
+    return Object.values(stored.state.annotations).flatMap((byUser) => Object.values(byUser)).length;
+  }).toBe(0);
 });
 
 test("assigned participant signs in and starts work from the server project", async ({ page }, testInfo) => {
@@ -235,6 +241,151 @@ test("server rejects stale state saves for a different project id", async ({ pag
   expect(response.status).toBe(409);
   expect(response.body.error).toContain("different server project");
   expect(readStoredProject(projectId).name).toBe("Example Project");
+});
+
+test("server rejects stale admin full-state overwrites", async ({ page }, testInfo) => {
+  await signIn(page, usernameFor(testInfo, "admin"));
+  const projectId = await page.locator("#projectPicker").inputValue();
+  const loaded = await page.evaluate(async (id) => {
+    const response = await fetch(`/api/projects/${encodeURIComponent(id)}`);
+    return response.json();
+  }, projectId);
+  const originalVersion = loaded.state.serverVersion;
+
+  const firstSave = await page.evaluate(async ({ id, version }) => {
+    const response = await fetch(`/api/projects/${encodeURIComponent(id)}/state`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        state: {
+          serverProjectId: id,
+          serverVersion: version,
+          activeRole: "admin",
+          projectName: "Versioned Project"
+        }
+      })
+    });
+    return response.json();
+  }, { id: projectId, version: originalVersion });
+  expect(firstSave.state.serverVersion).toBeGreaterThan(originalVersion);
+
+  const staleSave = await page.evaluate(async ({ id, version }) => {
+    const response = await fetch(`/api/projects/${encodeURIComponent(id)}/state`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        state: {
+          serverProjectId: id,
+          serverVersion: version,
+          activeRole: "admin",
+          projectName: "Stale Project"
+        }
+      })
+    });
+    return {
+      status: response.status,
+      body: await response.json()
+    };
+  }, { id: projectId, version: originalVersion });
+
+  expect(staleSave.status).toBe(409);
+  expect(staleSave.body.error).toContain("changed");
+  expect(readStoredProject(projectId).name).toBe("Versioned Project");
+});
+
+test("creating a project from full state restores known roster members", async ({ page }, testInfo) => {
+  const admin = usernameFor(testInfo, "admin");
+  const labeler = usernameFor(testInfo, "labeler");
+  await signIn(page, admin);
+  const me = await page.evaluate(async () => {
+    const response = await fetch("/api/me");
+    return response.json();
+  });
+
+  const result = await page.evaluate(async ({ currentUserId, labelerUsername }) => {
+    const response = await fetch("/api/projects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        state: {
+          projectName: "Imported Roster Project",
+          users: [
+            {
+              id: currentUserId,
+              participantName: "Imported Admin",
+              roles: ["admin", "labeler"]
+            },
+            {
+              username: labelerUsername,
+              participantName: "Imported Labeler",
+              roles: ["labeler"]
+            }
+          ],
+          records: [],
+          assignments: []
+        }
+      })
+    });
+    return response.json();
+  }, { currentUserId: me.user.id, labelerUsername: labeler });
+
+  expect(result.project.name).toBe("Imported Roster Project");
+  expect(result.state.users.map((user) => user.participantName).sort()).toEqual([
+    "Imported Admin",
+    "Imported Labeler"
+  ].sort());
+
+  await signOut(page);
+  await signIn(page, labeler);
+  await expect(page.locator("#projectPicker")).toContainText("Imported Roster Project");
+  await expect(page.locator("#currentUser")).toContainText("labeler");
+});
+
+test("restoring full state preserves embedded participants without account rows", async ({ page }, testInfo) => {
+  const admin = usernameFor(testInfo, "admin");
+  await signIn(page, admin);
+  const projectId = await page.locator("#projectPicker").inputValue();
+  const me = await page.evaluate(async () => {
+    const response = await fetch("/api/me");
+    return response.json();
+  });
+
+  const result = await page.evaluate(async ({ id, currentUserId }) => {
+    const response = await fetch(`/api/projects/${encodeURIComponent(id)}/state`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        state: {
+          serverProjectId: id,
+          projectName: "Restored Full State",
+          users: [
+            {
+              id: currentUserId,
+              participantName: "Recovered Admin",
+              roles: ["admin", "labeler"]
+            },
+            {
+              id: "u_aaaaaaaaaaaaaaaaaaaaaaaa",
+              participantName: "Recovered External Labeler",
+              roles: ["labeler"]
+            }
+          ],
+          records: [],
+          assignments: []
+        }
+      })
+    });
+    return response.json();
+  }, { id: projectId, currentUserId: me.user.id });
+
+  expect(result.state.users.map((user) => user.participantName).sort()).toEqual([
+    "Recovered Admin",
+    "Recovered External Labeler"
+  ].sort());
+
+  await page.reload();
+  await expect(page.locator("#projectPicker")).toHaveValue(projectId);
+  await expect(page.locator(".user-row").filter({ hasText: "Recovered External Labeler" })).toBeVisible();
 });
 
 test("server filesystem browser opens in a modal and reports availability", async ({ page }, testInfo) => {
@@ -541,14 +692,20 @@ test("resolver can clear a submitted resolution from the All queue", async ({ pa
   await page.getByRole("button", { name: "Workspace" }).click();
   await page.locator("#resolutionChoices").getByRole("button", { name: "Behavioral issue", exact: true }).click();
   await page.getByRole("button", { name: "Save resolution" }).click();
+  await expect.poll(() => {
+    const stored = readStoredProject(projectId);
+    return stored.state.resolutions[itemId]?.value || "";
+  }).toBe("Behavioral issue");
   await page.locator("#queueMode button[data-mode='all']").click();
   await expect(page.locator("#recordPosition")).toHaveText("Item 1 of 1");
 
   await page.getByRole("button", { name: "Clear selection" }).click();
 
   await expect(page.locator("#resolutionChoices").getByRole("button", { name: "Behavioral issue", exact: true })).toHaveAttribute("aria-pressed", "false");
-  const stored = readStoredProject(projectId);
-  expect(stored.state.resolutions[itemId]).toBeUndefined();
+  await expect.poll(() => {
+    const stored = readStoredProject(projectId);
+    return stored.state.resolutions[itemId]?.value || "";
+  }).toBe("");
 });
 
 test("admin is exported but never assigned review work unless given review roles", async ({ page }, testInfo) => {
@@ -606,6 +763,7 @@ test("can disable uncertain-label special handling", async ({ page }, testInfo) 
 
 test("edits participant names in the roster", async ({ page }, testInfo) => {
   await signIn(page, usernameFor(testInfo, "admin"));
+  const projectId = await page.locator("#projectPicker").inputValue();
   await addMember(page, usernameFor(testInfo, "charlie"), "Charlie", "labeler");
   const row = page.locator(".user-row").filter({ hasText: "participant: Charlie" });
   const input = row.locator(".user-name-input");
@@ -613,4 +771,15 @@ test("edits participant names in the roster", async ({ page }, testInfo) => {
   await input.blur();
 
   await expect(page.locator(".user-row").filter({ hasText: "participant: Reviewer Charlie" })).toBeVisible();
+  await expect.poll(() => {
+    const stored = readStoredProject(projectId);
+    return stored.state.users.some((user) => user.participantName === "Reviewer Charlie");
+  }).toBe(true);
+
+  await page.locator(".user-row").filter({ hasText: "participant: Reviewer Charlie" }).getByRole("button", { name: "x" }).click();
+  await expect(page.locator(".user-row").filter({ hasText: "participant: Reviewer Charlie" })).toHaveCount(0);
+  await expect.poll(() => {
+    const stored = readStoredProject(projectId);
+    return stored.state.users.some((user) => user.participantName === "Reviewer Charlie");
+  }).toBe(false);
 });

@@ -1069,6 +1069,7 @@ async function saveStateToServer() {
       body: { state: sanitizeStateForServer(state) }
     });
     state.lastSavedAt = result.state?.lastSavedAt || state.lastSavedAt;
+    state.serverVersion = result.state?.serverVersion ?? state.serverVersion;
     renderSaveStatus();
     await refreshProjects();
   } catch (error) {
@@ -1541,12 +1542,14 @@ async function addContextFiles(files) {
 
 async function restoreProjectFile(file) {
   try {
+    const targetServerVersion = state.serverVersion;
     const project = JSON.parse(await file.text());
     state = project.kind === "universal-labeling.project-definition"
       ? stateFromProjectDefinition(project)
       : normalizeState(project);
     if (auth?.token && activeProjectId) {
       state.serverProjectId = activeProjectId;
+      state.serverVersion = targetServerVersion;
     }
     selectedLabel = [];
     selectedResolution = [];
@@ -1566,12 +1569,14 @@ async function loadProjectForParticipant(file) {
   }
 
   try {
+    const targetServerVersion = state.serverVersion;
     const raw = JSON.parse(await file.text());
     state = raw.kind === "universal-labeling.project-definition"
       ? stateFromProjectDefinition(raw)
       : normalizeState(raw);
     if (auth?.token && activeProjectId) {
       state.serverProjectId = activeProjectId;
+      state.serverVersion = targetServerVersion;
     }
 
     const participant = {

@@ -18,6 +18,7 @@ const LEGACY_DEFAULT_PROJECT_NAME = "Software Review Labeling";
 const LEGACY_DEFAULT_PROJECT_ID = "software-review-labeling";
 const CURRENT_DB_SCHEMA_VERSION = 1;
 const CURRENT_STATE_VERSION = 2;
+const DEFAULT_SEED_USER_IDS = new Set(["u_admin", "u_labeler_a", "u_labeler_b", "u_resolver"]);
 const SERVER_FILE_ROOT = process.env.LABELING_FILE_ROOT
   ? fs.realpathSync(path.resolve(process.env.LABELING_FILE_ROOT))
   : "";
@@ -137,6 +138,7 @@ const createUserStmt = db.prepare(`
 const firstUserStmt = db.prepare("SELECT username_encrypted FROM users ORDER BY id LIMIT 1");
 const findUserByHashStmt = db.prepare("SELECT * FROM users WHERE username_hash = ?");
 const findUserByIdStmt = db.prepare("SELECT * FROM users WHERE id = ?");
+const findUserByHashPrefixStmt = db.prepare("SELECT * FROM users WHERE username_hash LIKE ? ORDER BY id LIMIT 1");
 const createSessionStmt = db.prepare(`
   INSERT INTO sessions (token_hash, user_id, created_at, expires_at)
   VALUES (?, ?, ?, ?)
@@ -203,6 +205,19 @@ const legacyDefaultProjectsStmt = db.prepare(`
   FROM projects
   WHERE name = ? OR state_json LIKE ?
 `);
+
+function stateUserFromAccount(user, participantName, roles) {
+  const publicId = publicUserIdFromHash(user.username_hash);
+  const normalizedRoles = normalizeRoles(roles);
+  return {
+    id: publicId,
+    userHash: publicId,
+    name: participantName,
+    participantName,
+    roles: normalizedRoles,
+    role: normalizedRoles[0] || "labeler"
+  };
+}
 
 function normalizeLabelValues(values) {
   const source = Array.isArray(values) ? values : String(values || "").split("|");
@@ -410,6 +425,85 @@ function getOrCreateUser(username) {
   createUserStmt.run(usernameHash, encryptText(normalized), nowIso());
   checkpointDatabase();
   return findUserByHashStmt.get(usernameHash);
+}
+
+function userFromPublicId(publicId) {
+  const normalized = String(publicId || "");
+  if (!/^u_[a-f0-9]{24}$/.test(normalized)) return null;
+  return findUserByHashPrefixStmt.get(`${normalized.slice(2)}%`) || null;
+}
+
+function stateUserMembership(stateUser) {
+  const roles = normalizeRoles(stateUser?.roles || [stateUser?.role]);
+  if (!roles.length) return null;
+  const participantName = String(stateUser.participantName || stateUser.name || stateUser.username || stateUser.id || "").trim();
+  if (!participantName) return null;
+  return { participantName, roles };
+}
+
+function accountForStateUser(stateUser) {
+  if (stateUser?.username) return getOrCreateUser(stateUser.username);
+  return userFromPublicId(stateUser?.id || stateUser?.userHash);
+}
+
+function upsertProjectMembersFromState(projectId, stateUsers, fallbackUser, timestamp = nowIso()) {
+  const currentPublicId = publicUserIdFromHash(fallbackUser.username_hash);
+  let hasFallbackMember = false;
+  let hasAdmin = false;
+
+  (Array.isArray(stateUsers) ? stateUsers : []).forEach((stateUser) => {
+    const membership = stateUserMembership(stateUser);
+    if (!membership) return;
+    const account = accountForStateUser(stateUser);
+    if (!account) return;
+    hasFallbackMember ||= account.id === fallbackUser.id;
+    hasAdmin ||= membership.roles.includes("admin");
+    upsertMemberStmt.run(
+      projectId,
+      account.id,
+      membership.participantName,
+      JSON.stringify(membership.roles),
+      timestamp,
+      timestamp
+    );
+  });
+
+  if (!hasFallbackMember) {
+    upsertMemberStmt.run(projectId, fallbackUser.id, "Project Admin", JSON.stringify(["admin"]), timestamp, timestamp);
+    hasAdmin = true;
+  } else if (!hasAdmin) {
+    const fallbackMembership = (Array.isArray(stateUsers) ? stateUsers : [])
+      .find((stateUser) => [stateUser?.id, stateUser?.userHash].includes(currentPublicId));
+    const name = fallbackMembership?.participantName || fallbackMembership?.name || "Project Admin";
+    const roles = normalizeRoles([...(fallbackMembership?.roles || [fallbackMembership?.role]), "admin"]);
+    upsertMemberStmt.run(projectId, fallbackUser.id, name, JSON.stringify(roles), timestamp, timestamp);
+  }
+}
+
+function reconcileStateMembershipsForUser(user) {
+  const publicId = publicUserIdFromHash(user.username_hash);
+  const timestamp = nowIso();
+  let changed = false;
+  allProjectsStmt.all().forEach((project) => {
+    const existingMembership = getMembership(project.id, user.id);
+    let state;
+    try {
+      state = JSON.parse(project.state_json);
+    } catch {
+      return;
+    }
+    const stateUser = (state.users || []).find((entry) => [entry?.id, entry?.userHash].includes(publicId));
+    const membership = stateUserMembership(stateUser);
+    if (!membership) return;
+    if (existingMembership) {
+      const existingRoles = rolesFromJson(existingMembership.roles_json);
+      const isBootstrapAdmin = existingMembership.participant_name === "Project Admin" && existingRoles.length === 1 && existingRoles[0] === "admin";
+      if (!isBootstrapAdmin) return;
+    }
+    upsertMemberStmt.run(project.id, user.id, membership.participantName, JSON.stringify(membership.roles), timestamp, timestamp);
+    changed = true;
+  });
+  if (changed) checkpointDatabase();
 }
 
 function serializeUser(row) {
@@ -700,6 +794,40 @@ function serializeMember(member, includeUsername) {
   return user;
 }
 
+function mergeStateUsersWithMembers(stateUsers, members, includeUsername) {
+  const merged = new Map();
+  (Array.isArray(stateUsers) ? stateUsers : []).forEach((stateUser) => {
+    const roles = normalizeRoles(stateUser.roles || [stateUser.role]);
+    const id = stateUser.id || stateUser.userHash;
+    if (!id || !roles.length) return;
+    if (members.length && DEFAULT_SEED_USER_IDS.has(id)) return;
+    merged.set(id, {
+      id,
+      userHash: stateUser.userHash || id,
+      name: stateUser.name || stateUser.participantName || id,
+      participantName: stateUser.participantName || stateUser.name || id,
+      roles,
+      role: roles[0] || "labeler"
+    });
+  });
+  members.forEach((member) => {
+    const serialized = serializeMember(member, includeUsername);
+    const existing = merged.get(serialized.id);
+    const isBootstrapAdmin = serialized.participantName === "Project Admin" && serialized.roles.length === 1 && serialized.roles[0] === "admin";
+    if (existing && isBootstrapAdmin) {
+      merged.set(serialized.id, {
+        ...existing,
+        roles: normalizeRoles([...existing.roles, ...serialized.roles]),
+        role: normalizeRoles([...existing.roles, ...serialized.roles])[0] || existing.role,
+        ...(serialized.username ? { username: serialized.username } : {})
+      });
+      return;
+    }
+    merged.set(serialized.id, serialized);
+  });
+  return [...merged.values()];
+}
+
 function decorateProjectState(project, actorRoles) {
   const includeUsername = actorRoles.includes("admin");
   const members = membersForProjectStmt.all(project.id);
@@ -710,8 +838,9 @@ function decorateProjectState(project, actorRoles) {
     state = migrateProjectStateShape({});
   }
   state.serverProjectId = project.id;
+  state.serverVersion = project.version;
   state.projectName = project.name || state.projectName || "Labeling Project";
-  state.users = members.map((member) => serializeMember(member, includeUsername));
+  state.users = mergeStateUsersWithMembers(state.users, members, includeUsername);
   state.lastSavedAt = project.updated_at;
   return state;
 }
@@ -741,11 +870,21 @@ function mergeMemberWork(existing, incoming, actorPublicId, roles) {
   merged.resolutions ||= {};
 
   if (roles.includes("labeler")) {
+    Object.entries(merged.annotations).forEach(([itemId, byUser]) => {
+      if (!byUser || !Object.hasOwn(byUser, actorPublicId)) return;
+      delete byUser[actorPublicId];
+      if (!Object.keys(byUser).length) delete merged.annotations[itemId];
+    });
     Object.entries(incomingState.annotations || {}).forEach(([itemId, byUser]) => {
       if (byUser?.[actorPublicId]) {
         merged.annotations[itemId] ||= {};
         merged.annotations[itemId][actorPublicId] = byUser[actorPublicId];
       }
+    });
+    Object.entries(merged.drafts.annotations || {}).forEach(([itemId, byUser]) => {
+      if (!byUser || !Object.hasOwn(byUser, actorPublicId)) return;
+      delete byUser[actorPublicId];
+      if (!Object.keys(byUser).length) delete merged.drafts.annotations[itemId];
     });
     Object.entries(incomingState.drafts?.annotations || {}).forEach(([itemId, byUser]) => {
       if (byUser?.[actorPublicId]) {
@@ -756,10 +895,18 @@ function mergeMemberWork(existing, incoming, actorPublicId, roles) {
   }
 
   if (roles.includes("resolver")) {
+    Object.entries(merged.resolutions).forEach(([itemId, resolution]) => {
+      if (resolution?.resolverId === actorPublicId) delete merged.resolutions[itemId];
+    });
     Object.entries(incomingState.resolutions || {}).forEach(([itemId, resolution]) => {
       if (resolution?.resolverId === actorPublicId) {
         merged.resolutions[itemId] = resolution;
       }
+    });
+    Object.entries(merged.drafts.resolutions || {}).forEach(([itemId, byUser]) => {
+      if (!byUser || !Object.hasOwn(byUser, actorPublicId)) return;
+      delete byUser[actorPublicId];
+      if (!Object.keys(byUser).length) delete merged.drafts.resolutions[itemId];
     });
     Object.entries(incomingState.drafts?.resolutions || {}).forEach(([itemId, byUser]) => {
       if (byUser?.[actorPublicId]) {
@@ -772,33 +919,88 @@ function mergeMemberWork(existing, incoming, actorPublicId, roles) {
   return merged;
 }
 
-function saveProjectState(project, nextState) {
+function saveProjectState(project, nextState, options = {}) {
+  const shouldCheckpoint = options.checkpoint !== false;
   const state = sanitizedStoredState(nextState, project.id);
   const name = String(state.projectName || project.name || "Labeling Project").trim() || "Labeling Project";
   const savedAt = nowIso();
   state.lastSavedAt = savedAt;
   updateProjectStateStmt.run(name, JSON.stringify(state), savedAt, project.id);
-  checkpointDatabase();
+  if (shouldCheckpoint) checkpointDatabase();
   return findProjectStmt.get(project.id);
+}
+
+function updateProjectStateUsers(project, mutateUsers, options = {}) {
+  let state;
+  try {
+    state = migrateProjectStateShape(JSON.parse(project.state_json));
+  } catch {
+    state = migrateProjectStateShape({});
+  }
+  const nextUsers = mutateUsers(Array.isArray(state.users) ? state.users : [], state);
+  state.users = Array.isArray(nextUsers) ? nextUsers : [];
+  return saveProjectState(project, state, options);
+}
+
+function upsertStateUser(project, user, participantName, roles, options = {}) {
+  return updateProjectStateUsers(project, (users) => {
+    const nextUser = stateUserFromAccount(user, participantName, roles);
+    const existingIndex = users.findIndex((entry) => [entry?.id, entry?.userHash].includes(nextUser.id));
+    if (existingIndex >= 0) {
+      users[existingIndex] = {
+        ...users[existingIndex],
+        ...nextUser
+      };
+      return users;
+    }
+    return [...users, nextUser];
+  }, options);
+}
+
+function removeStateUser(project, publicUserId, options = {}) {
+  return updateProjectStateUsers(project, (users, state) => {
+    state.assignments = (state.assignments || []).filter((assignment) => assignment.userId !== publicUserId);
+    Object.keys(state.annotations || {}).forEach((itemId) => {
+      if (state.annotations[itemId]) delete state.annotations[itemId][publicUserId];
+      if (!Object.keys(state.annotations[itemId] || {}).length) delete state.annotations[itemId];
+    });
+    Object.keys(state.drafts?.annotations || {}).forEach((itemId) => {
+      if (state.drafts.annotations[itemId]) delete state.drafts.annotations[itemId][publicUserId];
+      if (!Object.keys(state.drafts.annotations[itemId] || {}).length) delete state.drafts.annotations[itemId];
+    });
+    Object.keys(state.drafts?.resolutions || {}).forEach((itemId) => {
+      if (state.drafts.resolutions[itemId]) delete state.drafts.resolutions[itemId][publicUserId];
+      if (!Object.keys(state.drafts.resolutions[itemId] || {}).length) delete state.drafts.resolutions[itemId];
+    });
+    Object.keys(state.resolutions || {}).forEach((itemId) => {
+      if (state.resolutions[itemId]?.resolverId === publicUserId) delete state.resolutions[itemId];
+    });
+    if (state.currentUserId === publicUserId) {
+      state.currentUserId = users.find((user) => ![user?.id, user?.userHash].includes(publicUserId))?.id || "";
+    }
+    return users.filter((user) => ![user?.id, user?.userHash].includes(publicUserId));
+  }, options);
+}
+
+function writeRolesForStateSave(memberRoles, activeRole) {
+  if (["labeler", "resolver"].includes(activeRole) && memberRoles.includes(activeRole)) {
+    return [activeRole];
+  }
+  if (memberRoles.includes("admin")) return ["admin"];
+  return memberRoles;
 }
 
 function createProjectForUser(user, stateInput) {
   const projectId = `p_${crypto.randomBytes(9).toString("hex")}`;
   const createdAt = nowIso();
+  const importedUsers = Array.isArray(stateInput?.users) ? stateInput.users : [];
   const state = sanitizedStoredState(stateInput || {}, projectId);
   const name = String(state.projectName || DEFAULT_PROJECT_NAME).trim() || DEFAULT_PROJECT_NAME;
   state.projectName = name;
   state.currentUserId = publicUserIdFromHash(user.username_hash);
   state.activeRole = "admin";
   createProjectStmt.run(projectId, name, JSON.stringify(state), user.id, createdAt, createdAt);
-  upsertMemberStmt.run(
-    projectId,
-    user.id,
-    "Project Admin",
-    JSON.stringify(["admin"]),
-    createdAt,
-    createdAt
-  );
+  upsertProjectMembersFromState(projectId, importedUsers.length ? importedUsers : state.users, user, createdAt);
   checkpointDatabase();
   return findProjectStmt.get(projectId);
 }
@@ -823,6 +1025,7 @@ app.get("/api/health", (_req, res) => {
 app.post("/api/auth/login", (req, res, next) => {
   try {
     const user = getOrCreateUser(req.body?.username);
+    reconcileStateMembershipsForUser(user);
     const token = crypto.randomBytes(32).toString("hex");
     const createdAt = nowIso();
     const expiresAt = new Date(Date.now() + SESSION_DAYS * 24 * 60 * 60 * 1000).toISOString();
@@ -843,10 +1046,12 @@ app.post("/api/auth/logout", requireAuth, (req, res) => {
 });
 
 app.get("/api/me", requireAuth, (req, res) => {
+  reconcileStateMembershipsForUser(req.user);
   res.json({ user: serializeUser(req.user) });
 });
 
 app.get("/api/projects", requireAuth, (req, res) => {
+  reconcileStateMembershipsForUser(req.user);
   res.json({
     projects: listProjectsStmt.all(req.user.id).map((project) => ({
       id: project.id,
@@ -940,12 +1145,19 @@ app.put("/api/projects/:projectId/state", requireAuth, requireProjectMember, (re
     if (incomingState.serverProjectId && incomingState.serverProjectId !== req.project.id) {
       return res.status(409).json({ error: "Project state belongs to a different server project." });
     }
+    const writeRoles = writeRolesForStateSave(req.roles, incomingState.activeRole);
+    if (writeRoles.includes("admin") && incomingState.serverVersion != null && Number(incomingState.serverVersion) !== req.project.version) {
+      return res.status(409).json({ error: "Project has changed since this page loaded. Refresh before saving admin changes." });
+    }
     let nextState = incomingState;
-    if (!req.roles.includes("admin")) {
+    if (!writeRoles.includes("admin")) {
       const existing = JSON.parse(req.project.state_json);
-      nextState = mergeMemberWork(existing, incomingState, publicUserIdFromHash(req.user.username_hash), req.roles);
+      nextState = mergeMemberWork(existing, incomingState, publicUserIdFromHash(req.user.username_hash), writeRoles);
     }
     const project = saveProjectState(req.project, nextState);
+    if (writeRoles.includes("admin")) {
+      upsertProjectMembersFromState(project.id, incomingState.users, req.user);
+    }
     req.project = project;
     sendProject(req, res, project);
   } catch (error) {
@@ -965,9 +1177,16 @@ app.post("/api/projects/:projectId/members", requireAuth, requireProjectMember, 
       return res.status(400).json({ error: "Participant name is required." });
     }
     const timestamp = nowIso();
-    upsertMemberStmt.run(req.project.id, user.id, participantName, JSON.stringify(roles), timestamp, timestamp);
+    let project;
+    db.transaction(() => {
+      upsertMemberStmt.run(req.project.id, user.id, participantName, JSON.stringify(roles), timestamp, timestamp);
+      project = upsertStateUser(req.project, user, participantName, roles, { checkpoint: false });
+    })();
     checkpointDatabase();
-    sendProject(req, res);
+    req.project = project;
+    req.membership = getMembership(project.id, req.user.id);
+    req.roles = rolesFromJson(req.membership.roles_json);
+    sendProject(req, res, project);
   } catch (error) {
     next(error);
   }
@@ -984,9 +1203,16 @@ app.patch("/api/projects/:projectId/members/:publicUserId", requireAuth, require
     }
     const participantName = String(req.body?.participantName || target.participant_name || "").trim();
     if (!participantName) return res.status(400).json({ error: "Participant name is required." });
-    upsertMemberStmt.run(req.project.id, target.user_id, participantName, JSON.stringify(roles), target.created_at, nowIso());
+    let project;
+    db.transaction(() => {
+      upsertMemberStmt.run(req.project.id, target.user_id, participantName, JSON.stringify(roles), target.created_at, nowIso());
+      project = upsertStateUser(req.project, target, participantName, roles, { checkpoint: false });
+    })();
     checkpointDatabase();
-    sendProject(req, res);
+    req.project = project;
+    req.membership = getMembership(project.id, req.user.id);
+    req.roles = rolesFromJson(req.membership.roles_json);
+    sendProject(req, res, project);
   } catch (error) {
     next(error);
   }
@@ -1001,9 +1227,17 @@ app.delete("/api/projects/:projectId/members/:publicUserId", requireAuth, requir
     if (rolesFromJson(target.roles_json).includes("admin") && members.filter((member) => rolesFromJson(member.roles_json).includes("admin")).length <= 1) {
       return res.status(400).json({ error: "Keep at least one admin on the project." });
     }
-    deleteMemberStmt.run(req.project.id, target.user_id);
+    const targetPublicId = memberPublicId(target);
+    let project;
+    db.transaction(() => {
+      deleteMemberStmt.run(req.project.id, target.user_id);
+      project = removeStateUser(req.project, targetPublicId, { checkpoint: false });
+    })();
     checkpointDatabase();
-    sendProject(req, res);
+    req.project = project;
+    req.membership = getMembership(project.id, req.user.id);
+    req.roles = rolesFromJson(req.membership.roles_json);
+    sendProject(req, res, project);
   } catch (error) {
     next(error);
   }
