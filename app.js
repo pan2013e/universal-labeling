@@ -333,8 +333,10 @@ function bindEvents() {
     }
   });
   el.logoutButton.addEventListener("click", logout);
-  el.projectPicker.addEventListener("change", () => {
-    activeProjectId = el.projectPicker.value;
+  el.projectPicker.addEventListener("change", async () => {
+    const nextProjectId = el.projectPicker.value;
+    await flushServerSave();
+    activeProjectId = nextProjectId;
     localStorage.setItem(ACTIVE_PROJECT_KEY, activeProjectId);
     loadProjectFromServer(activeProjectId);
   });
@@ -652,7 +654,10 @@ async function loginFromForm() {
     saveAuth(result);
     await refreshProjects();
     if (projects.length) {
-      await loadProjectFromServer(projects[0].id);
+      const targetProject = projects.some((project) => project.id === activeProjectId)
+        ? activeProjectId
+        : projects[0].id;
+      await loadProjectFromServer(targetProject);
     } else {
       await createProjectOnServer();
     }
@@ -673,8 +678,6 @@ async function logout() {
   }
   saveAuth(null);
   projects = [];
-  activeProjectId = "";
-  localStorage.removeItem(ACTIVE_PROJECT_KEY);
   state = createDefaultState();
   renderAll();
 }
@@ -1049,13 +1052,17 @@ function clearLegacyProjectCache() {
 }
 
 function queueServerSave() {
-  if (isApplyingServerState || !auth?.token || !activeProjectId) return;
+  if (!canSaveActiveProjectState()) return;
   clearTimeout(serverSaveTimer);
   serverSaveTimer = setTimeout(saveStateToServer, 450);
 }
 
+function canSaveActiveProjectState() {
+  return Boolean(auth?.token && activeProjectId && !isApplyingServerState && state.serverProjectId === activeProjectId);
+}
+
 async function saveStateToServer() {
-  if (!auth?.token || !activeProjectId) return;
+  if (!canSaveActiveProjectState()) return;
   try {
     const result = await apiRequest(`/api/projects/${encodeURIComponent(activeProjectId)}/state`, {
       method: "PUT",
@@ -1071,7 +1078,7 @@ async function saveStateToServer() {
 
 async function flushServerSave() {
   clearTimeout(serverSaveTimer);
-  if (!auth?.token || !activeProjectId || isApplyingServerState) return;
+  if (!canSaveActiveProjectState()) return;
   await saveStateToServer();
 }
 
@@ -1538,6 +1545,9 @@ async function restoreProjectFile(file) {
     state = project.kind === "universal-labeling.project-definition"
       ? stateFromProjectDefinition(project)
       : normalizeState(project);
+    if (auth?.token && activeProjectId) {
+      state.serverProjectId = activeProjectId;
+    }
     selectedLabel = [];
     selectedResolution = [];
     persistAndRender();
@@ -1560,6 +1570,9 @@ async function loadProjectForParticipant(file) {
     state = raw.kind === "universal-labeling.project-definition"
       ? stateFromProjectDefinition(raw)
       : normalizeState(raw);
+    if (auth?.token && activeProjectId) {
+      state.serverProjectId = activeProjectId;
+    }
 
     const participant = {
       id: el.participantId.value.trim() || slugify(name),

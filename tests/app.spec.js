@@ -1,7 +1,7 @@
 const { test, expect } = require("@playwright/test");
 const Database = require("better-sqlite3");
 const fs = require("fs");
-const path = require("path");
+const { TEST_DB_PATH } = require("./test-db-path");
 
 function slug(value) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 42);
@@ -54,7 +54,7 @@ async function selectRole(page, role) {
 }
 
 function readStoredProject(projectId) {
-  const dbPath = path.join(__dirname, "..", "data", "universal-labeling.sqlite");
+  const dbPath = process.env.LABELING_DB_PATH || TEST_DB_PATH;
   const db = new Database(dbPath, { readonly: true, fileMustExist: true });
   try {
     const row = db.prepare("SELECT name, state_json FROM projects WHERE id = ?").get(projectId);
@@ -187,6 +187,54 @@ test("new project starts from a blank workspace instead of cloning current data"
   await expect(page.locator("#projectDescription")).toHaveValue("");
   await expect(page.locator("#dataFilePath")).toHaveValue("");
   await expect(page.locator("#recordCount")).toHaveText("0");
+});
+
+test("signing out and back in restores the previously active project", async ({ page }, testInfo) => {
+  const admin = usernameFor(testInfo, "admin");
+  await signIn(page, admin);
+  const exampleProjectId = await page.locator("#projectPicker").inputValue();
+  await page.getByRole("button", { name: "New project" }).click();
+  await expect(page.locator("#projectName")).toHaveValue("New Project");
+  const activeProjectId = await page.locator("#projectPicker").inputValue();
+  await page.locator("#projectName").fill("Persistent Project");
+
+  await page.locator("#projectPicker").selectOption(exampleProjectId);
+  await expect(page.locator("#projectName")).toHaveValue("Example Project");
+  await page.locator("#projectDescription").fill("Make the example project newer.");
+  await page.locator("#projectPicker").selectOption(activeProjectId);
+  await expect(page.locator("#projectName")).toHaveValue("Persistent Project");
+
+  await signOut(page);
+  await signIn(page, admin);
+
+  await expect(page.locator("#projectPicker")).toHaveValue(activeProjectId);
+  await expect(page.locator("#projectName")).toHaveValue("Persistent Project");
+});
+
+test("server rejects stale state saves for a different project id", async ({ page }, testInfo) => {
+  await signIn(page, usernameFor(testInfo, "admin"));
+  const projectId = await page.locator("#projectPicker").inputValue();
+
+  const response = await page.evaluate(async (id) => {
+    const result = await fetch(`/api/projects/${encodeURIComponent(id)}/state`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        state: {
+          serverProjectId: "p_wrong_project",
+          projectName: "Stale overwrite"
+        }
+      })
+    });
+    return {
+      status: result.status,
+      body: await result.json()
+    };
+  }, projectId);
+
+  expect(response.status).toBe(409);
+  expect(response.body.error).toContain("different server project");
+  expect(readStoredProject(projectId).name).toBe("Example Project");
 });
 
 test("server filesystem browser opens in a modal and reports availability", async ({ page }, testInfo) => {

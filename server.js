@@ -35,6 +35,24 @@ const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
 db.pragma("busy_timeout = 5000");
+db.pragma("wal_autocheckpoint = 100");
+
+function checkpointDatabase(mode = "PASSIVE") {
+  try {
+    db.pragma(`wal_checkpoint(${mode})`);
+  } catch (error) {
+    console.warn(`SQLite checkpoint failed: ${error.message}`);
+  }
+}
+
+function closeDatabaseAndExit(signal) {
+  checkpointDatabase("TRUNCATE");
+  db.close();
+  process.exit(signal === "SIGINT" ? 130 : 143);
+}
+
+process.once("SIGINT", () => closeDatabaseAndExit("SIGINT"));
+process.once("SIGTERM", () => closeDatabaseAndExit("SIGTERM"));
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
@@ -70,10 +88,16 @@ db.exec(`
     updated_at TEXT NOT NULL,
     PRIMARY KEY (project_id, user_id)
   );
+
+  CREATE TABLE IF NOT EXISTS app_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
 `);
 
 function tableColumns(tableName) {
-  const knownTables = new Set(["users", "sessions", "projects", "project_members"]);
+  const knownTables = new Set(["users", "sessions", "projects", "project_members", "app_metadata"]);
   if (!knownTables.has(tableName)) {
     throw new Error(`Unknown migration table: ${tableName}`);
   }
@@ -110,6 +134,7 @@ const createUserStmt = db.prepare(`
   INSERT INTO users (username_hash, username_encrypted, created_at)
   VALUES (?, ?, ?)
 `);
+const firstUserStmt = db.prepare("SELECT username_encrypted FROM users ORDER BY id LIMIT 1");
 const findUserByHashStmt = db.prepare("SELECT * FROM users WHERE username_hash = ?");
 const findUserByIdStmt = db.prepare("SELECT * FROM users WHERE id = ?");
 const createSessionStmt = db.prepare(`
@@ -165,6 +190,13 @@ const upsertMemberStmt = db.prepare(`
 `);
 const deleteMemberStmt = db.prepare(`
   DELETE FROM project_members WHERE project_id = ? AND user_id = ?
+`);
+const getMetadataStmt = db.prepare("SELECT value FROM app_metadata WHERE key = ?");
+const upsertMetadataStmt = db.prepare(`
+  INSERT INTO app_metadata (key, value, updated_at)
+  VALUES (?, ?, ?)
+  ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                  updated_at = excluded.updated_at
 `);
 const legacyDefaultProjectsStmt = db.prepare(`
   SELECT id, name, state_json
@@ -333,12 +365,50 @@ function decryptText(value) {
   ]).toString("utf8");
 }
 
+let secretMismatch = false;
+
+function verifySecretMarker() {
+  const key = "secret_marker";
+  const marker = hmac("universal-labeling-secret-marker", "config");
+  const existing = getMetadataStmt.get(key);
+  if (!existing) {
+    const firstUser = firstUserStmt.get();
+    if (firstUser) {
+      try {
+        decryptText(firstUser.username_encrypted);
+      } catch {
+        secretMismatch = true;
+        console.error("LABELING_SECRET does not match the existing database. Set the original LABELING_SECRET or use a different LABELING_DB_PATH.");
+        return;
+      }
+    }
+    upsertMetadataStmt.run(key, marker, nowIso());
+    checkpointDatabase();
+    return;
+  }
+  if (existing.value !== marker) {
+    secretMismatch = true;
+    console.error("LABELING_SECRET does not match this database. Existing users and projects cannot be loaded safely.");
+  }
+}
+
+function assertSecretCompatible() {
+  if (!secretMismatch) return;
+  const error = new Error("Server secret does not match this database. Restart with the original LABELING_SECRET or use a different LABELING_DB_PATH.");
+  error.status = 503;
+  throw error;
+}
+
+verifySecretMarker();
+
 function getOrCreateUser(username) {
+  assertSecretCompatible();
   const normalized = assertUsername(username);
   const usernameHash = hmac(normalized, "username");
   const existing = findUserByHashStmt.get(usernameHash);
   if (existing) return existing;
   createUserStmt.run(usernameHash, encryptText(normalized), nowIso());
+  checkpointDatabase();
   return findUserByHashStmt.get(usernameHash);
 }
 
@@ -708,6 +778,7 @@ function saveProjectState(project, nextState) {
   const savedAt = nowIso();
   state.lastSavedAt = savedAt;
   updateProjectStateStmt.run(name, JSON.stringify(state), savedAt, project.id);
+  checkpointDatabase();
   return findProjectStmt.get(project.id);
 }
 
@@ -728,6 +799,7 @@ function createProjectForUser(user, stateInput) {
     createdAt,
     createdAt
   );
+  checkpointDatabase();
   return findProjectStmt.get(projectId);
 }
 
@@ -755,6 +827,7 @@ app.post("/api/auth/login", (req, res, next) => {
     const createdAt = nowIso();
     const expiresAt = new Date(Date.now() + SESSION_DAYS * 24 * 60 * 60 * 1000).toISOString();
     createSessionStmt.run(tokenHash(token), user.id, createdAt, expiresAt);
+    checkpointDatabase();
     setSessionCookie(req, res, token);
     res.json({ token, user: serializeUser(user) });
   } catch (error) {
@@ -764,6 +837,7 @@ app.post("/api/auth/login", (req, res, next) => {
 
 app.post("/api/auth/logout", requireAuth, (req, res) => {
   deleteSessionStmt.run(req.sessionTokenHash);
+  checkpointDatabase();
   clearSessionCookie(req, res);
   res.json({ ok: true });
 });
@@ -853,6 +927,7 @@ app.post("/api/projects/:projectId/server-files/resolve", requireAuth, requirePr
 app.delete("/api/projects/:projectId", requireAuth, requireProjectMember, requireProjectAdmin, (req, res, next) => {
   try {
     deleteProjectStmt.run(req.project.id);
+    checkpointDatabase();
     res.json({ ok: true, deletedProjectId: req.project.id });
   } catch (error) {
     next(error);
@@ -862,6 +937,9 @@ app.delete("/api/projects/:projectId", requireAuth, requireProjectMember, requir
 app.put("/api/projects/:projectId/state", requireAuth, requireProjectMember, (req, res, next) => {
   try {
     const incomingState = req.body?.state || {};
+    if (incomingState.serverProjectId && incomingState.serverProjectId !== req.project.id) {
+      return res.status(409).json({ error: "Project state belongs to a different server project." });
+    }
     let nextState = incomingState;
     if (!req.roles.includes("admin")) {
       const existing = JSON.parse(req.project.state_json);
@@ -888,6 +966,7 @@ app.post("/api/projects/:projectId/members", requireAuth, requireProjectMember, 
     }
     const timestamp = nowIso();
     upsertMemberStmt.run(req.project.id, user.id, participantName, JSON.stringify(roles), timestamp, timestamp);
+    checkpointDatabase();
     sendProject(req, res);
   } catch (error) {
     next(error);
@@ -906,6 +985,7 @@ app.patch("/api/projects/:projectId/members/:publicUserId", requireAuth, require
     const participantName = String(req.body?.participantName || target.participant_name || "").trim();
     if (!participantName) return res.status(400).json({ error: "Participant name is required." });
     upsertMemberStmt.run(req.project.id, target.user_id, participantName, JSON.stringify(roles), target.created_at, nowIso());
+    checkpointDatabase();
     sendProject(req, res);
   } catch (error) {
     next(error);
@@ -922,6 +1002,7 @@ app.delete("/api/projects/:projectId/members/:publicUserId", requireAuth, requir
       return res.status(400).json({ error: "Keep at least one admin on the project." });
     }
     deleteMemberStmt.run(req.project.id, target.user_id);
+    checkpointDatabase();
     sendProject(req, res);
   } catch (error) {
     next(error);
