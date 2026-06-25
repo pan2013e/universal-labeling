@@ -83,6 +83,7 @@ test("filters navigation and export actions by active project role", async ({ pa
   await expect(page.getByRole("heading", { name: "Participants" })).toBeVisible();
   await expect(page.locator(".creator-card")).toBeVisible();
   await expect(page.locator(".participant-card")).toBeHidden();
+  await expect(page.locator("#exportMyData")).toBeHidden();
 
   await enableOwnRole(page, "labeler");
   await selectRole(page, "labeler");
@@ -92,12 +93,14 @@ test("filters navigation and export actions by active project role", async ({ pa
   await expect(page.locator(".creator-card")).toBeHidden();
   await expect(page.getByRole("heading", { name: "Review Workspace" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Final CSV" })).toBeHidden();
+  await expect(page.locator("#exportMyData")).toBeVisible();
 
   await selectRole(page, "admin");
   await enableOwnRole(page, "resolver");
   await selectRole(page, "resolver");
   await expect(page.locator(".nav-item[data-view='backend']")).toBeHidden();
   await expect(page.getByRole("heading", { name: "Review Workspace" })).toBeVisible();
+  await expect(page.locator("#exportMyData")).toBeVisible();
 });
 
 test("loads sample data and labels one item with a multi-role admin account", async ({ page }, testInfo) => {
@@ -117,6 +120,37 @@ test("loads sample data and labels one item with a multi-role admin account", as
 
   await selectRole(page, "admin");
   await expect(page.getByText("1/4 label assignments")).toBeVisible();
+});
+
+test("non-admin can export only the current user's workspace data", async ({ page }, testInfo) => {
+  const username = usernameFor(testInfo, "admin");
+  await signIn(page, username);
+  await enableOwnRole(page, "labeler");
+  await selectRole(page, "admin");
+  await loadSample(page);
+  await selectRole(page, "labeler");
+  await page.getByRole("button", { name: "Workspace" }).click();
+
+  await page.locator("#labelChoices").getByRole("button", { name: "Behavioral issue", exact: true }).click();
+  await page.locator("#labelNotes").fill("current user export note");
+  await page.getByRole("button", { name: "Save label" }).click();
+
+  const [download] = await Promise.all([
+    page.waitForEvent("download"),
+    page.getByRole("button", { name: "Export my data" }).click()
+  ]);
+  const exportPath = testInfo.outputPath("current-user-data.json");
+  await download.saveAs(exportPath);
+  const exported = JSON.parse(fs.readFileSync(exportPath, "utf8"));
+
+  expect(exported.kind).toBe("universal-labeling.current-user-data");
+  expect(exported.activeRole).toBe("labeler");
+  expect(exported.user.roles).toContain("labeler");
+  expect(exported.assignments.length).toBeGreaterThan(0);
+  expect(exported.records.length).toBe(exported.assignments.length);
+  expect(exported.counts.submittedAnnotations).toBe(1);
+  expect(Object.values(exported.annotations)[0].notes).toBe("current user export note");
+  expect(JSON.stringify(exported)).not.toContain(username);
 });
 
 test("submitted labels survive refresh when switching back to labeler role", async ({ page }, testInfo) => {
@@ -150,6 +184,28 @@ test("submitted labels survive refresh when switching back to labeler role", asy
 
   await expect(page.locator("#recordPosition")).toHaveText("Item 1 of 2");
   await expect(page.locator(".queue-item")).toHaveCount(2);
+});
+
+test("workspace role opens the TODO queue by default", async ({ page }, testInfo) => {
+  await signIn(page, usernameFor(testInfo, "admin"));
+  await enableOwnRole(page, "labeler");
+  await selectRole(page, "admin");
+  await loadSample(page);
+  await selectRole(page, "labeler");
+  await page.getByRole("button", { name: "Workspace" }).click();
+
+  await expect(page.locator("#queueMode button[data-mode='todo']")).toHaveText("TODO");
+  await expect(page.locator("#queueMode button[data-mode='todo']")).toHaveClass(/active/);
+
+  await page.locator("#labelChoices").getByRole("button", { name: "Behavioral issue", exact: true }).click();
+  await page.getByRole("button", { name: "Save label" }).click();
+  await page.locator("#queueMode button[data-mode='done']").click();
+  await expect(page.locator("#queueMode button[data-mode='done']")).toHaveClass(/active/);
+
+  await selectRole(page, "admin");
+  await selectRole(page, "labeler");
+
+  await expect(page.locator("#queueMode button[data-mode='todo']")).toHaveClass(/active/);
 });
 
 test("submitted label uses compact work update instead of full project state", async ({ page }, testInfo) => {

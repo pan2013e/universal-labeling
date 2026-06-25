@@ -434,6 +434,14 @@ label > span,
   max-width: 720px;
 }
 
+.workspace-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
 .button-row,
 .export-grid {
   align-items: center;

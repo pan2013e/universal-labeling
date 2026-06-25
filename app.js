@@ -427,6 +427,7 @@ function bindEvents() {
       }
       state.activeRole = nextRole;
       state.currentItemId = null;
+      resetWorkspaceQueueForActiveRole();
       persistAndRender(null, { queueServer: false });
     } catch (error) {
       alert(`Could not save project before switching roles: ${error.message}`);
@@ -541,6 +542,7 @@ function bindEvents() {
   el.clearProject.addEventListener("click", clearProject);
   el.exportProjectDefinition.addEventListener("click", exportProjectDefinition);
   el.exportProject.addEventListener("click", exportProject);
+  el.exportMyData.addEventListener("click", exportCurrentUserData);
   el.exportLabelsJsonl.addEventListener("click", exportLabelsJsonl);
   el.exportFinalCsv.addEventListener("click", exportFinalCsv);
   el.saveLabel.addEventListener("click", saveCurrentLabel);
@@ -864,10 +866,19 @@ function applyServerProject(result) {
     ? nextState.activeRole
     : availableRoles[0] || "admin";
   state = nextState;
+  resetWorkspaceQueueForActiveRole();
   selectedLabel = [];
   selectedResolution = [];
   clearLegacyProjectCache();
   isApplyingServerState = false;
+}
+
+function resetWorkspaceQueueForActiveRole() {
+  const user = getCurrentUser();
+  if (user?.role === "labeler" || user?.role === "resolver") {
+    state.queueMode = "todo";
+    state.currentItemId = null;
+  }
 }
 
 function sanitizeStateForServer(inputState) {
@@ -1443,11 +1454,13 @@ function applyRoleVisibility() {
   setFormControlState(el.participantId, !permissions.canLoadParticipantDefinition);
   setFormControlState(el.participantRole, !permissions.canLoadParticipantDefinition);
   setFormControlState(el.exportProject, !permissions.canUseFullState);
+  setFormControlState(el.exportMyData, !permissions.canUseWorkspace);
   setFormControlState(el.exportLabelsJsonl, !permissions.canExportLabels);
   setFormControlState(el.exportFinalCsv, !permissions.canExportFinal);
   setFormControlState(el.clearProject, !permissions.canClearProject);
 
   el.deleteProject?.classList.toggle("hidden", !permissions.canDeleteProject);
+  el.exportMyData?.classList.toggle("hidden", !permissions.canUseWorkspace);
   el.exportLabelsJsonl?.classList.toggle("hidden", !permissions.canExportLabels);
   el.exportFinalCsv?.classList.toggle("hidden", !permissions.canExportFinal);
 }
@@ -3940,6 +3953,104 @@ function exportProject() {
     kind: "universal-labeling.workspace-state",
     ...sanitizeStateForServer(state)
   }, null, 2), "application/json");
+}
+
+function buildCurrentUserDataExport() {
+  const user = getCurrentUser();
+  if (!user || !getPermissions(user).canUseWorkspace) return null;
+
+  const assignedIds = new Set(
+    state.assignments
+      .filter((assignment) => assignment.userId === user.id && assignment.role === user.role)
+      .map((assignment) => assignment.itemId)
+  );
+  const assignments = state.assignments.filter((assignment) => assignedIds.has(assignment.itemId)
+    && assignment.userId === user.id
+    && assignment.role === user.role);
+  const records = getWorkRecords()
+    .filter((record) => assignedIds.has(record.id))
+    .map((record) => ({
+      id: record.id,
+      sourceIndex: record.sourceIndex,
+      data: record.data,
+      contextFiles: record.contextFiles || []
+    }));
+  const annotations = {};
+  const annotationDrafts = {};
+  const resolutions = {};
+  const resolutionDrafts = {};
+
+  assignedIds.forEach((itemId) => {
+    const annotation = state.annotations[itemId]?.[user.id];
+    if (annotation) {
+      annotations[itemId] = annotation;
+    }
+
+    const annotationDraft = state.drafts.annotations[itemId]?.[user.id];
+    if (annotationDraft) {
+      annotationDrafts[itemId] = annotationDraft;
+    }
+
+    const resolution = state.resolutions[itemId];
+    if (resolution?.resolverId === user.id) {
+      resolutions[itemId] = resolution;
+    }
+
+    const resolutionDraft = state.drafts.resolutions[itemId]?.[user.id];
+    if (resolutionDraft) {
+      resolutionDrafts[itemId] = resolutionDraft;
+    }
+  });
+
+  return {
+    kind: "universal-labeling.current-user-data",
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    project: {
+      id: state.metadata.projectId || state.serverProjectId || activeProjectId || "",
+      serverProjectId: state.serverProjectId || activeProjectId || "",
+      name: state.projectName
+    },
+    user: sanitizeUserForOutput(user),
+    activeRole: user.role,
+    protocol: {
+      primaryQuestion: state.protocol.primaryQuestion,
+      resolutionQuestion: state.protocol.resolutionQuestion,
+      labels: state.protocol.labels,
+      labelCardinality: state.protocol.labelCardinality,
+      allowCustomLabels: Boolean(state.protocol.allowCustomLabels),
+      enableUncertain: Boolean(state.protocol.enableUncertain),
+      uncertainLabel: state.protocol.uncertainLabel,
+      requireConfidence: Boolean(state.protocol.requireConfidence),
+      requireNotes: Boolean(state.protocol.requireNotes),
+      contextFields: getContextFields()
+    },
+    assignments,
+    records,
+    annotations,
+    annotationDrafts,
+    resolutions,
+    resolutionDrafts,
+    counts: {
+      assignments: assignments.length,
+      records: records.length,
+      submittedAnnotations: Object.keys(annotations).length,
+      annotationDrafts: Object.keys(annotationDrafts).length,
+      submittedResolutions: Object.keys(resolutions).length,
+      resolutionDrafts: Object.keys(resolutionDrafts).length
+    }
+  };
+}
+
+function exportCurrentUserData() {
+  const payload = buildCurrentUserDataExport();
+  if (!payload) return;
+  const userPart = safeFileName(payload.user.participantName || payload.user.id || "user");
+  downloadFile(
+    `${safeFileName(state.projectName)}-${userPart}-${safeFileName(payload.activeRole)}-data.json`,
+    JSON.stringify(payload, null, 2),
+    "application/json"
+  );
 }
 
 function exportLabelsJsonl() {
