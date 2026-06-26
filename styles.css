@@ -562,6 +562,14 @@ label > span,
   margin-bottom: 14px;
 }
 
+.sampling-ids {
+  align-items: end;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(260px, 1fr) auto;
+  margin-bottom: 14px;
+}
+
 .sample-calculator {
   align-items: end;
   background: var(--surface-strong);
@@ -1607,6 +1615,7 @@ button.mini-move {
   .server-file-layout,
   .workflow-grid,
   .sampling-grid,
+  .sampling-ids,
   .derived-grid,
   .sample-calculator {
     grid-template-columns: 1fr;

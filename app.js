@@ -415,6 +415,17 @@ function bindEvents() {
     renderSamplingWarnings();
     schedulePersist();
   });
+  el.samplingIdsInput.addEventListener("input", () => {
+    if (!getPermissions().canEditProject) return;
+    renderSamplingWarnings();
+  });
+  el.samplingIdsFile.addEventListener("change", (event) => {
+    const file = event.target.files[0];
+    if (file) {
+      importSampledIdsFile(file);
+    }
+    event.target.value = "";
+  });
 
   el.currentUser.addEventListener("change", async () => {
     const nextRole = el.currentUser.value;
@@ -1397,6 +1408,8 @@ function applyRoleVisibility() {
     el.samplingMode,
     el.samplingPercent,
     el.samplingCount,
+    el.samplingIdsInput,
+    el.samplingIdsFile,
     el.sampleConfidence,
     el.sampleMargin,
     el.sampleProportion,
@@ -1650,6 +1663,22 @@ function renderServerFilePreview(file) {
   el.serverFilePreview.textContent = previewText;
   el.serverFileConfirm.textContent = serverFileBrowser.purpose === "data" ? "Import selected" : "Add selected";
   el.serverFileConfirm.disabled = !canConfirm;
+}
+
+async function importSampledIdsFile(file) {
+  if (!getPermissions().canEditProject) return;
+  try {
+    const text = await file.text();
+    const sampledItemIds = parseSampledItemIdsInput(text, { requireJsonObject: true });
+    el.samplingMode.value = "ids";
+    el.samplingIdsInput.value = formatSampledItemIds(sampledItemIds);
+    state.sampling.mode = "ids";
+    updateSamplingControls();
+    applySamplingPlan();
+  } catch (error) {
+    alert(error.message || "The sampled item IDs file could not be imported.");
+    renderSamplingWarnings();
+  }
 }
 
 function truncatePreviewText(text, maxLength = 6000) {
@@ -1966,7 +1995,7 @@ function parseDelimitedRows(text, delimiter) {
 
 function normalizeRecord(record, index) {
   const data = isPlainObject(record) ? flattenObject(record) : { value: record };
-  const provisionalId = findFirstValue(data, ["id", "uuid", "key", "comment_id", "review_id", "github_id"]);
+  const provisionalId = findFirstValue(data, ["id", "instance_id", "uuid", "key", "comment_id", "review_id", "github_id"]);
   const id = String(provisionalId || `item_${String(index + 1).padStart(5, "0")}`);
   return {
     id,
@@ -2026,6 +2055,17 @@ function getAllFields(records = state.records) {
 
 function getWorkRecords(target = state) {
   if (target.sampling.mode === "all") return target.records;
+  if (target.sampling.mode === "ids") {
+    const recordsById = buildSampledRecordResolver(target.records);
+    const seen = new Set();
+    return normalizeSampledItemIds(target.sampling.sampledItemIds || [])
+      .map((id) => recordsById.get(id))
+      .filter((record) => {
+        if (!record || seen.has(record.id)) return false;
+        seen.add(record.id);
+        return true;
+      });
+  }
   const sampled = new Set(target.sampling.sampledItemIds || []);
   if (!sampled.size) return target.records;
   return target.records.filter((record) => sampled.has(record.id));
@@ -2034,6 +2074,7 @@ function getWorkRecords(target = state) {
 function buildSampledItemIds(records, sampling) {
   if (!records.length) return [];
   if (sampling.mode === "all") return records.map((record) => record.id);
+  if (sampling.mode === "ids") return normalizeSampledItemIds(sampling.sampledItemIds || []);
 
   const targetCount = sampling.mode === "percent"
     ? Math.ceil(records.length * Math.max(1, Math.min(100, sampling.percent)) / 100)
@@ -2041,6 +2082,128 @@ function buildSampledItemIds(records, sampling) {
 
   return stableShuffle(records.map((record) => record.id), `${state.metadata.projectId || state.projectName}:${records.length}`)
     .slice(0, targetCount);
+}
+
+function normalizeSampledItemIds(ids) {
+  const seen = new Set();
+  return (Array.isArray(ids) ? ids : [])
+    .map((id) => String(id ?? "").trim())
+    .filter((id) => {
+      if (!id || seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
+}
+
+function buildSampledRecordResolver(records) {
+  const entries = new Map();
+  const addAlias = (alias, record, priority) => {
+    const key = String(alias || "").trim();
+    if (!key) return;
+    const existing = entries.get(key);
+    if (!existing || priority < existing.priority) {
+      entries.set(key, { record, priority });
+    }
+  };
+
+  records.forEach((record) => {
+    getRecordIdAliases(record).forEach(({ alias, priority }) => addAlias(alias, record, priority));
+  });
+  return new Map([...entries].map(([alias, entry]) => [alias, entry.record]));
+}
+
+function getRecordIdAliases(record) {
+  const aliases = [];
+  const add = (alias, priority) => {
+    const key = String(alias || "").trim();
+    if (key) aliases.push({ alias: key, priority });
+  };
+  const data = record?.data || {};
+  const baseIds = normalizeSampledItemIds([
+    record?.id,
+    data.id,
+    data.instance_id,
+    data.source_record_id
+  ]);
+
+  const splitSuffix = String(record?.id || "").match(/::(.+)$/)?.[1];
+  const splitFields = new Set();
+  Object.keys(data).forEach((key) => {
+    if (key.endsWith(".__index")) {
+      splitFields.add(key.slice(0, -"__index".length - 1));
+    }
+  });
+  if (splitSuffix) {
+    const field = splitSuffix.replace(/\[[^\]]+\]$/, "");
+    if (field) splitFields.add(field);
+  }
+
+  if (!splitFields.size) {
+    baseIds.forEach((id) => add(id, 0));
+    return aliases;
+  }
+
+  splitFields.forEach((field) => {
+    const arrayIndexValues = normalizeSampledItemIds([
+      data[`${field}.__index`],
+      data.item_index
+    ]);
+    const metadataIndexValues = normalizeSampledItemIds([
+      data[`${field}.__stage3_comment_index`],
+      data[`${field}.comment_index`],
+      data[`${field}.index`],
+      data.comment_index
+    ]);
+    baseIds.forEach((baseId) => {
+      arrayIndexValues.forEach((index) => add(`${baseId}::${field}[${index}]`, 0));
+      if (splitSuffix) add(`${baseId}::${splitSuffix}`, 1);
+      metadataIndexValues.forEach((index) => add(`${baseId}::${field}[${index}]`, 2));
+    });
+  });
+
+  return aliases;
+}
+
+function formatSampledItemIds(ids) {
+  return JSON.stringify({ sampledItemIds: normalizeSampledItemIds(ids) }, null, 2);
+}
+
+function parseSampledItemIdsInput(text, options = {}) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return [];
+
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    const parsed = JSON.parse(trimmed);
+    if (Array.isArray(parsed)) {
+      if (options.requireJsonObject) {
+        throw new Error("The JSON file must be an object with a sampledItemIds array.");
+      }
+      return normalizeSampledItemIds(parsed);
+    }
+    if (isPlainObject(parsed) && Array.isArray(parsed.sampledItemIds)) {
+      return normalizeSampledItemIds(parsed.sampledItemIds);
+    }
+    throw new Error("Provide JSON with shape {\"sampledItemIds\": [...]}.");
+  }
+
+  if (options.requireJsonObject) {
+    throw new Error("The uploaded file must be JSON with shape {\"sampledItemIds\": [...]}.");
+  }
+  return normalizeSampledItemIds(trimmed.split(/[\s,]+/));
+}
+
+function readSampledItemIdsInput(options = {}) {
+  try {
+    return {
+      ids: parseSampledItemIdsInput(el.samplingIdsInput?.value || "", options),
+      error: ""
+    };
+  } catch (error) {
+    return {
+      ids: [],
+      error: error.message || "Sampled item IDs could not be parsed."
+    };
+  }
 }
 
 function stableShuffle(values, seedText) {
@@ -2260,7 +2423,7 @@ function splitRecordsBySelectedArrayField() {
       data.comment_index = String(childIndex);
       data[`${field}.__index`] = String(index);
       derived.push({
-        id: `${record.id}::${field}[${childIndex}]`,
+        id: `${record.id}::${field}[${index}]`,
         data,
         sourceIndex: record.sourceIndex,
         contextFiles: record.contextFiles || []
@@ -2378,6 +2541,7 @@ function renderSampling() {
   el.samplingMode.value = state.sampling.mode;
   el.samplingPercent.value = state.sampling.percent;
   el.samplingCount.value = state.sampling.count;
+  el.samplingIdsInput.value = formatSampledItemIds(state.sampling.sampledItemIds);
   el.sampleConfidence.value = state.sampling.confidenceLevel;
   el.sampleMargin.value = state.sampling.marginOfError;
   el.sampleProportion.value = state.sampling.populationProportion;
@@ -2393,6 +2557,7 @@ function updateSamplingControls() {
   const mode = el.samplingMode.value;
   el.samplingPercentField.classList.toggle("hidden", mode !== "percent");
   el.samplingCountField.classList.toggle("hidden", mode !== "count");
+  el.samplingIdsField.classList.toggle("hidden", mode !== "ids");
 }
 
 function renderSampleSizeSuggestion() {
@@ -2413,13 +2578,16 @@ function calculateSuggestedSampleSize() {
 }
 
 function getSamplingFormValues() {
+  const sampledIds = readSampledItemIdsInput();
   return {
     mode: el.samplingMode?.value || state.sampling.mode,
     percent: Number(el.samplingPercent?.value),
     count: Number(el.samplingCount?.value),
     confidenceLevel: Number(el.sampleConfidence?.value) || state.sampling.confidenceLevel,
     marginOfError: Number(el.sampleMargin?.value),
-    populationProportion: Number(el.sampleProportion?.value)
+    populationProportion: Number(el.sampleProportion?.value),
+    sampledItemIds: sampledIds.ids,
+    sampledItemIdsError: sampledIds.error
   };
 }
 
@@ -2436,6 +2604,21 @@ function renderSamplingWarnings() {
   }
   if (values.mode === "count" && (!Number.isFinite(values.count) || values.count < 1 || values.count > population)) {
     warnings.push(`Count must be between 1 and ${Math.max(population, 1)} for the loaded data.`);
+  }
+  if (values.mode === "ids") {
+    if (values.sampledItemIdsError) {
+      warnings.push(values.sampledItemIdsError);
+    } else if (!values.sampledItemIds.length) {
+      warnings.push("Provide at least one sampled item ID.");
+    } else {
+      const recordIds = buildSampledRecordResolver(state.records);
+      const missingIds = values.sampledItemIds.filter((id) => !recordIds.has(id));
+      if (missingIds.length) {
+        const visibleIds = missingIds.slice(0, 5).join(", ");
+        const suffix = missingIds.length > 5 ? `, and ${missingIds.length - 5} more` : "";
+        warnings.push(`Sampled item IDs must match imported records. Unknown IDs: ${visibleIds}${suffix}.`);
+      }
+    }
   }
   if (!Number.isFinite(values.marginOfError) || values.marginOfError <= 0 || values.marginOfError > 50) {
     warnings.push("Margin of error must be greater than 0 and at most 50%.");
@@ -2470,6 +2653,10 @@ function applySamplingPlan() {
   state.sampling.confidenceLevel = values.confidenceLevel;
   state.sampling.marginOfError = values.marginOfError;
   state.sampling.populationProportion = values.populationProportion;
+  if (values.mode === "ids") {
+    state.sampling.count = values.sampledItemIds.length;
+    state.sampling.sampledItemIds = values.sampledItemIds;
+  }
   state.sampling.sampledItemIds = buildSampledItemIds(state.records, state.sampling);
   state.sampling.appliedAt = new Date().toISOString();
   state.currentItemId = null;
@@ -3915,7 +4102,9 @@ function buildProjectDefinition() {
     detectedFormat: state.detectedFormat,
     sampling: {
       ...state.sampling,
-      sampledItemIds: getWorkRecords().map((record) => record.id)
+      sampledItemIds: state.sampling.mode === "ids"
+        ? normalizeSampledItemIds(state.sampling.sampledItemIds)
+        : getWorkRecords().map((record) => record.id)
     },
     fields: state.fields,
     protocol: {

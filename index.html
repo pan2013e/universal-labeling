@@ -201,6 +201,7 @@
                   <option value="all">All data entries</option>
                   <option value="percent">Random percent</option>
                   <option value="count">Random count</option>
+                  <option value="ids">Given item IDs</option>
                 </select>
               </label>
               <label id="samplingPercentField">
@@ -212,6 +213,16 @@
                 <input id="samplingCount" type="number" min="1" step="1">
               </label>
               <button id="applySampling" type="button">Apply sampling</button>
+            </div>
+            <div id="samplingIdsField" class="sampling-ids hidden">
+              <label>
+                <span>Sampled item IDs</span>
+                <textarea id="samplingIdsInput" rows="5" placeholder='{"sampledItemIds":["item_00001","item_00002"]}'></textarea>
+              </label>
+              <label class="file-button secondary">
+                Upload sampled IDs
+                <input id="samplingIdsFile" type="file" accept=".json,application/json">
+              </label>
             </div>
             <div class="sample-calculator">
               <div>

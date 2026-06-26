@@ -697,6 +697,95 @@ test("samples records and exports deterministic sampled ids", async ({ page }, t
   expect(definition.assignments).toHaveLength(6);
 });
 
+test("applies sampled item ids from text input and uploaded json", async ({ page }, testInfo) => {
+  await signIn(page, usernameFor(testInfo, "admin"));
+  await loadSample(page);
+
+  await page.locator("#samplingMode").selectOption("ids");
+  await page.locator("#samplingIdsInput").fill("django-34411-c3\npytest-10012-c8");
+  await page.getByRole("button", { name: "Apply sampling" }).click();
+
+  await expect(page.getByText("2 of 4 entries selected")).toBeVisible();
+  await expect(page.locator("#protocolSnapshot")).toContainText('"mode": "ids"');
+  await expect(page.locator("#protocolSnapshot")).toContainText('"count": 2');
+
+  const sampledIdsPath = testInfo.outputPath("sampled-ids.json");
+  fs.writeFileSync(sampledIdsPath, JSON.stringify({
+    sampledItemIds: ["pandas-50102-c2", "sympy-23927-c1"]
+  }));
+  await page.locator("#samplingIdsFile").setInputFiles(sampledIdsPath);
+
+  await expect(page.getByText("2 of 4 entries selected")).toBeVisible();
+  await page.locator(".nav-item[data-view='backend']").click();
+  const [download] = await Promise.all([
+    page.waitForEvent("download"),
+    page.getByRole("button", { name: "Export definition" }).click()
+  ]);
+  const definitionPath = testInfo.outputPath("sampled-ids-definition.json");
+  await download.saveAs(definitionPath);
+  const definition = JSON.parse(fs.readFileSync(definitionPath, "utf8"));
+
+  expect(definition.sampling.mode).toBe("ids");
+  expect(definition.sampling.count).toBe(2);
+  expect(definition.sampling.sampledItemIds).toEqual(["pandas-50102-c2", "sympy-23927-c1"]);
+});
+
+test("applies sampled split item ids using instance id aliases", async ({ page }, testInfo) => {
+  await signIn(page, usernameFor(testInfo, "admin"));
+  await addMember(page, usernameFor(testInfo, "labeler"), "Labeler", "labeler");
+
+  const dataPath = testInfo.outputPath("stage5-like-records.json");
+  fs.writeFileSync(dataPath, JSON.stringify([
+    {
+      id: "local-1",
+      instance_id: "dask__dask-7974@88a13f7",
+      reference_review_comments: [
+        { __stage3_comment_index: 0, text: "First Dask comment" }
+      ]
+    },
+    {
+      id: "local-2",
+      instance_id: "gradio-app__gradio-3275@067f582",
+      reference_review_comments: [
+        { __stage3_comment_index: 1, text: "First Gradio comment" },
+        { __stage3_comment_index: 2, text: "Second Gradio comment" }
+      ]
+    }
+  ]));
+
+  await page.locator(".nav-item[data-view='backend']").click();
+  await page.locator("#dataFile").setInputFiles(dataPath);
+  await page.locator("#splitArrayField").selectOption("reference_review_comments");
+  await page.getByRole("button", { name: "Split into labeling items" }).click();
+  await expect(page.getByText("3 labeling items")).toBeVisible();
+
+  const sampledIds = [
+    "dask__dask-7974@88a13f7::reference_review_comments[0]",
+    "gradio-app__gradio-3275@067f582::reference_review_comments[0]",
+    "gradio-app__gradio-3275@067f582::reference_review_comments[1]"
+  ];
+  await page.locator("#samplingMode").selectOption("ids");
+  await page.locator("#samplingIdsInput").fill(JSON.stringify({ sampledItemIds: sampledIds }));
+  await page.getByRole("button", { name: "Apply sampling" }).click();
+
+  await expect(page.locator("#samplingWarnings")).toBeEmpty();
+  await expect(page.getByText("3 of 3 entries selected")).toBeVisible();
+  const [download] = await Promise.all([
+    page.waitForEvent("download"),
+    page.getByRole("button", { name: "Export definition" }).click()
+  ]);
+  const definitionPath = testInfo.outputPath("stage5-like-definition.json");
+  await download.saveAs(definitionPath);
+  const definition = JSON.parse(fs.readFileSync(definitionPath, "utf8"));
+
+  expect(definition.sampling.sampledItemIds).toEqual(sampledIds);
+  expect(definition.assignments.map((assignment) => assignment.itemId).sort()).toEqual([
+    "local-1::reference_review_comments[0]",
+    "local-2::reference_review_comments[0]",
+    "local-2::reference_review_comments[1]"
+  ].sort());
+});
+
 test("updates sample-size suggestion live and warns on impossible count", async ({ page }, testInfo) => {
   await signIn(page, usernameFor(testInfo, "admin"));
   await loadSample(page);
